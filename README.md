@@ -7,6 +7,17 @@ v1 goal:
 - Trigger web search when the user asks for current/external information
 - Persist both user and assistant messages to CortexLTM even when tools are used
 
+## Release Notes (Feb 14, 2026)
+
+- Improved routing precision with three explicit buckets:
+  - explicit web-intent cues (for example: "search online", "look up", "show links")
+  - time-sensitive fact requests (latest/news/price/schedule style questions)
+  - non-web writing/coding tasks that should stay in normal chat
+- Added safer verification override behavior:
+  - high-stakes verification can force web search for factual question-style prompts
+  - drafting/coding/translation-style prompts are not force-routed to web search
+- Improved high-stakes verification responses by appending source links when checks fail.
+
 ## Architecture
 
 - `cortexagent/router/intent_router.py`
