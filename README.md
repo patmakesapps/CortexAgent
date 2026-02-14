@@ -6,6 +6,7 @@ v1 goal:
 - Route normal chat to CortexLTM
 - Trigger web search when the user asks for current/external information
 - Persist both user and assistant messages to CortexLTM even when tools are used
+- Support Google Calendar read + write flows with explicit user confirmation
 
 ## Release Notes (Feb 14, 2026)
 
@@ -17,17 +18,28 @@ v1 goal:
   - high-stakes verification can force web search for factual question-style prompts
   - drafting/coding/translation-style prompts are not force-routed to web search
 - Improved high-stakes verification responses by appending source links when checks fail.
+- Added Google Calendar write support via quick-add with confirmation-first flow:
+  - write intents now route to Google Calendar more reliably, including common phrasing/typos
+  - draft prompts include structured event fields (title/day/time and assumptions when inferred)
+  - user can confirm with `confirm` (or `confirm: ...`) and cancel with `cancel`
+  - follow-up edits (for example title changes) are merged into the pending draft
+- Added created-event proof links in post-write responses:
+  - created entries include direct Google Calendar event links when available
+- Added anti-hallucination safety for calendar writes:
+  - chat-only responses are prevented from claiming an event was added unless calendar tooling executed
 
 ## Architecture
 
 - `cortexagent/router/intent_router.py`
-  - Heuristic intent gating (`chat` vs `web_search`)
+  - Heuristic/model intent gating (`chat` vs `web_search` vs `google_calendar`)
 - `cortexagent/tools/base.py`
   - Generic tool interfaces
 - `cortexagent/tools/registry.py`
   - Tool registration and lookup
 - `cortexagent/tools/web_search.py`
   - Web search tool with provider abstraction
+- `cortexagent/tools/google_calendar.py`
+  - Google Calendar list + create logic (confirmation-gated writes)
 - `cortexagent/services/cortexltm_client.py`
   - HTTP client for CortexLTM endpoints
 - `cortexagent/services/orchestrator.py`
@@ -102,7 +114,7 @@ Optional:
 ## Route
 
 - `POST /v1/agent/threads/{thread_id}/chat`
-  - If tool intent is detected and enabled, runs web search and returns a cited answer.
+  - If tool intent is detected and enabled, runs web search or Google Calendar action.
   - Otherwise forwards to CortexLTM `/v1/threads/{thread_id}/chat`.
 - `POST /v1/agent/integrations/google/connect`
   - Exchanges Google OAuth `code` for tokens, validates caller via bearer token, and upserts a row in `ltm_connected_accounts`.
@@ -111,3 +123,4 @@ Optional:
 
 - The tool system is intentionally modular for future connectors (Notion, Slack, Calendar, etc.).
 - Routing is model-first (system-prompt classifier) with heuristic fallback.
+- Calendar write confirmations are intentionally explicit to avoid accidental writes.

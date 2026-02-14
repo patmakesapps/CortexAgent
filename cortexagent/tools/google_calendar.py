@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import re
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -12,6 +13,9 @@ from .base import Tool, ToolContext, ToolResult, ToolResultItem
 class GoogleCalendarTool(Tool):
     name = "google_calendar"
     CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+    CALENDAR_QUICK_ADD_URL = (
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events/quickAdd"
+    )
 
     def run(self, context: ToolContext) -> ToolResult:
         tool_meta = context.tool_meta or {}
@@ -26,11 +30,78 @@ class GoogleCalendarTool(Tool):
             max_results = 7
         max_results = min(20, max(1, max_results))
 
-        items = self._list_upcoming_events(
-            access_token=access_token.strip(),
-            max_results=max_results,
-        )
+        token = access_token.strip()
+        items: list[ToolResultItem] = []
+        if _is_create_intent(context.user_text):
+            if not _has_explicit_write_confirmation(context.user_text):
+                return ToolResult(
+                    tool_name=self.name,
+                    query=context.user_text.strip(),
+                    items=[
+                        ToolResultItem(
+                            title="Confirmation required",
+                            url="https://calendar.google.com/",
+                            snippet=_build_confirmation_prompt(context.user_text),
+                        )
+                    ],
+                )
+            created_item = self._quick_add_event(
+                access_token=token,
+                event_text=_strip_confirmation_prefix(context.user_text),
+            )
+            items.append(created_item)
+            max_results = max(0, max_results - 1)
+
+        if max_results > 0:
+            items.extend(
+                self._list_upcoming_events(
+                    access_token=token,
+                    max_results=max_results,
+                )
+            )
         return ToolResult(tool_name=self.name, query=context.user_text.strip(), items=items)
+
+    def _quick_add_event(self, access_token: str, event_text: str) -> ToolResultItem:
+        params = urlparse.urlencode({"text": event_text})
+        url = f"{self.CALENDAR_QUICK_ADD_URL}?{params}"
+        req = urlrequest.Request(
+            url,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=8) as res:
+                payload = json.loads(res.read().decode("utf-8"))
+        except urlerror.HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise RuntimeError("Google Calendar authorization failed. Please reconnect Google.")
+            if exc.code == 400:
+                raise RuntimeError(
+                    "I could not create that event. Please include a clear date and time."
+                )
+            raise RuntimeError(f"Google Calendar API failed ({exc.code}).")
+        except Exception as exc:
+            raise RuntimeError(f"Google Calendar API failed: {exc}")
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("Google Calendar returned an unexpected create-event payload.")
+
+        title = str(payload.get("summary") or "Untitled event").strip()
+        start_label = _event_time_label(payload.get("start"))
+        location = str(payload.get("location") or "").strip()
+        snippet = "Created event"
+        if start_label:
+            snippet += f" | {start_label}"
+        if location:
+            snippet += f" | {location}"
+        return ToolResultItem(
+            title=f"[Created] {title}",
+            url=str(payload.get("htmlLink") or "https://calendar.google.com/").strip(),
+            snippet=snippet,
+        )
 
     def _list_upcoming_events(
         self, access_token: str, max_results: int
@@ -117,3 +188,172 @@ def _event_time_label(start: object) -> str:
         except ValueError:
             return f"Starts: {date_only.strip()} (all day)"
     return "Time unavailable"
+
+
+def _is_create_intent(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    create_terms = (
+        "create event",
+        "add event",
+        "add meeting",
+        "create meeting",
+        "schedule meeting",
+        "book meeting",
+        "set up meeting",
+        "put on my calendar",
+        "add to my calendar",
+    )
+    if any(term in lowered for term in create_terms):
+        return True
+    has_write_verb = bool(
+        re.search(r"\b(add|ad|create|schedule|book|set up|put)\b", lowered)
+    )
+    has_calendar_ref = "calendar" in lowered
+    has_event_ref = bool(re.search(r"\b(meeting|event|appointment|call)\b", lowered))
+    has_pronoun_ref = bool(re.search(r"\b(it|this|that)\b", lowered))
+    if has_write_verb and has_calendar_ref and (has_event_ref or has_pronoun_ref):
+        return True
+    pattern = re.compile(
+        r"\b(add|ad|create|schedule|book|set up)\b.*\b(meeting|event|appointment)\b"
+    )
+    reverse_pattern = re.compile(
+        r"\b(meeting|event|appointment|call)\b.*\b(add|ad|create|schedule|book|set up|put)\b"
+    )
+    return bool(pattern.search(lowered) or reverse_pattern.search(lowered))
+
+
+def _has_explicit_write_confirmation(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    confirmation_terms = (
+        "confirm:",
+        "confirm ",
+        "yes, create",
+        "yes create",
+        "go ahead and create",
+        "proceed to create",
+    )
+    return any(term in lowered for term in confirmation_terms)
+
+
+def _strip_confirmation_prefix(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return cleaned
+    lowered = cleaned.lower()
+    if lowered.startswith("confirm:"):
+        return cleaned[len("confirm:") :].strip()
+    if lowered.startswith("confirm "):
+        return cleaned[len("confirm ") :].strip()
+    return cleaned
+
+
+def _build_confirmation_prompt(text: str) -> str:
+    cleaned = (text or "").strip()
+    lowered = cleaned.lower()
+    name_match = re.search(
+        r"\bwith\s+([a-z][a-z\s'-]{1,50}?)(?=\s+(?:on|at|in|and|for|its|it'?s|please|add|create|schedule|book)\b|[,.!?]|$)",
+        lowered,
+    )
+    subject = "Meeting"
+    if name_match:
+        person = name_match.group(1).strip(" .")
+        subject = "Meeting with " + " ".join(part.capitalize() for part in person.split())
+
+    day_match = re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)\b",
+        lowered,
+    )
+    concrete_date_match = re.search(
+        r"\b(?:"
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+        r")\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b"
+        r"|"
+        r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
+        lowered,
+    )
+    assumed_day = False
+    assumed_day_note = ""
+    if concrete_date_match:
+        day = concrete_date_match.group(0).strip()
+    elif day_match:
+        day_token = day_match.group(1).lower()
+        if day_token in _WEEKDAY_TO_INDEX:
+            day = _closest_future_day_label(preferred_weekday=_WEEKDAY_TO_INDEX[day_token])
+            assumed_day = True
+            assumed_day_note = f"closest upcoming {day_token.capitalize()}"
+        elif day_token == "today":
+            day = datetime.now().astimezone().strftime("%A, %b %d, %Y")
+        else:
+            day = (datetime.now().astimezone() + timedelta(days=1)).strftime(
+                "%A, %b %d, %Y"
+            )
+    else:
+        day = _closest_future_day_label(preferred_weekday=None)
+        assumed_day = True
+        assumed_day_note = "closest upcoming day"
+
+    time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b", lowered)
+    assumed_time = False
+    if time_match:
+        time_value = time_match.group(1).upper().replace(" ", "")
+    else:
+        time_value = "09:00AM"
+        assumed_time = True
+
+    if time_value.endswith("AM") or time_value.endswith("PM"):
+        if ":" in time_value:
+            pass
+        elif len(time_value) <= 4:
+            time_value = time_value[:-2] + ":00" + time_value[-2:]
+        time_value = time_value[:-2] + " " + time_value[-2:]
+
+    assumption_lines: list[str] = []
+    if assumed_day:
+        assumption_lines.append(
+            f"I assumed the {assumed_day_note} in the future: {day}."
+        )
+    if assumed_time:
+        assumption_lines.append(f"I assumed the time: {time_value}.")
+
+    assumption_block = ""
+    if assumption_lines:
+        assumption_block = "\nAssumptions to confirm: " + " ".join(assumption_lines)
+
+    return (
+        "I have this draft event:\n"
+        f"- Title: {subject}\n"
+        f"- Day: {day}\n"
+        f"- Time: {time_value}\n"
+        f"{assumption_block}\n"
+        "Should I add this to Google Calendar? "
+        "Reply with 'confirm' to proceed or 'cancel' to stop."
+    )
+
+
+_WEEKDAY_TO_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _closest_future_day_label(preferred_weekday: int | None) -> str:
+    today = datetime.now().astimezone().date()
+    if preferred_weekday is None:
+        days_ahead = 1
+    else:
+        # Monday=0 ... Sunday=6
+        days_ahead = (preferred_weekday - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+    target = today + timedelta(days=days_ahead)
+    return target.strftime("%A, %b %d, %Y")

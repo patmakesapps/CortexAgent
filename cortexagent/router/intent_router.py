@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import json
+import re
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -58,6 +59,11 @@ GOOGLE_CALENDAR_TERMS = (
     "next meeting",
     "today on my calendar",
     "tomorrow on my calendar",
+    "add event",
+    "create event",
+    "schedule meeting",
+    "add to my calendar",
+    "put on my calendar",
 )
 
 
@@ -70,6 +76,12 @@ class RouteDecision:
 
 def _keyword_decision(user_text: str) -> RouteDecision:
     text = user_text.strip().lower()
+    if _matches_explicit_calendar_write_intent(text):
+        return RouteDecision(
+            action="google_calendar",
+            reason="matched_explicit_google_calendar_write_intent",
+            confidence=0.97,
+        )
     if any(term in text for term in GOOGLE_CALENDAR_TERMS):
         return RouteDecision(
             action="google_calendar",
@@ -98,6 +110,20 @@ def _looks_like_time_sensitive_fact_request(text: str) -> bool:
     if not question_like:
         return False
     return any(term in text for term in TIME_SENSITIVE_FACT_TERMS)
+
+
+def _matches_explicit_calendar_write_intent(text: str) -> bool:
+    if not text:
+        return False
+    if re.search(
+        r"\b(add|ad|create|schedule|book|set up|put)\b.*\b(my|the|this|that|it)\b.*\bcalendar\b",
+        text,
+    ):
+        return True
+    pattern = re.compile(
+        r"\b(add|ad|create|schedule|book|set up)\b.*\b(meeting|event|appointment)\b"
+    )
+    return bool(pattern.search(text))
 
 
 def _extract_json(content: str) -> dict[str, object]:
@@ -192,6 +218,13 @@ def decide_action(user_text: str, tools_enabled: bool, web_search_enabled: bool)
 
     if not tools_enabled:
         return RouteDecision(action="chat", reason="tools_disabled", confidence=1.0)
+
+    if _matches_explicit_calendar_write_intent(text):
+        return RouteDecision(
+            action="google_calendar",
+            reason="matched_explicit_google_calendar_write_intent",
+            confidence=0.97,
+        )
 
     if web_search_enabled:
         llm_route = _llm_decision(user_text)

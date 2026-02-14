@@ -41,6 +41,7 @@ class AgentOrchestrator:
         self.tool_registry = tool_registry
         self.connected_accounts_repo = connected_accounts_repo
         self.google_oauth = google_oauth
+        self._pending_calendar_drafts: dict[str, str] = {}
 
     def handle_chat(
         self,
@@ -49,12 +50,33 @@ class AgentOrchestrator:
         short_term_limit: int | None,
         authorization: str | None,
     ) -> OrchestratorResult:
+        pending_calendar_draft = self._pending_calendar_drafts.get(thread_id)
+        if pending_calendar_draft and _is_calendar_cancel_reply(text):
+            self._pending_calendar_drafts.pop(thread_id, None)
+            response = "Understood. I canceled this calendar draft and did not add anything."
+            return OrchestratorResult(
+                response=response,
+                decision=AgentDecision(
+                    action="google_calendar",
+                    reason="calendar_draft_canceled",
+                    confidence=1.0,
+                ),
+                sources=[],
+            )
+
         verification = assess_verification_profile(text)
-        route = decide_action(
-            user_text=text,
-            tools_enabled=settings.agent_tools_enabled,
-            web_search_enabled=settings.web_search_enabled,
-        )
+        if pending_calendar_draft and _is_calendar_confirmation_reply(text):
+            route = RouteDecision(
+                action="google_calendar",
+                reason="calendar_confirmation_followup",
+                confidence=0.99,
+            )
+        else:
+            route = decide_action(
+                user_text=text,
+                tools_enabled=settings.agent_tools_enabled,
+                web_search_enabled=settings.web_search_enabled,
+            )
         if (
             verification.requires_web_verification
             and settings.agent_tools_enabled
@@ -81,6 +103,10 @@ class AgentOrchestrator:
                 sources=[],
                 profile=verification,
             )
+            assistant_text = _prevent_unexecuted_calendar_write_claims(
+                assistant_text=assistant_text,
+                routed_action=route.action,
+            )
             return OrchestratorResult(
                 response=assistant_text,
                 decision=AgentDecision(
@@ -93,6 +119,12 @@ class AgentOrchestrator:
 
         if route.action == "google_calendar":
             tool = self.tool_registry.get("google_calendar")
+            effective_calendar_text = text
+            if pending_calendar_draft and _is_calendar_confirmation_reply(text):
+                effective_calendar_text = _build_confirmed_calendar_request(
+                    draft_text=pending_calendar_draft,
+                    followup_text=text,
+                )
             try:
                 access_token, token_meta = self._resolve_google_access_token(
                     authorization=authorization
@@ -113,7 +145,7 @@ class AgentOrchestrator:
                 result = tool.run(
                     ToolContext(
                         thread_id=thread_id,
-                        user_text=text,
+                        user_text=effective_calendar_text,
                         tool_meta={
                             "access_token": access_token,
                             "max_results": 8,
@@ -136,6 +168,13 @@ class AgentOrchestrator:
                 )
 
             assistant_text, sources = _format_google_calendar_response(result.items)
+            if _is_calendar_confirmation_required_items(result.items):
+                self._pending_calendar_drafts[thread_id] = _extract_calendar_draft_text(
+                    items=result.items,
+                    fallback=effective_calendar_text,
+                )
+            elif _is_calendar_created_items(result.items):
+                self._pending_calendar_drafts.pop(thread_id, None)
             self._persist_tool_events(
                 thread_id=thread_id,
                 user_text=text,
@@ -223,24 +262,21 @@ class AgentOrchestrator:
         capability_label: str,
         extra_meta: dict[str, object] | None = None,
     ) -> None:
-        # Best effort persistence: tool responses should still return even if writes fail.
-        try:
-            self.ltm_client.add_event(
-                thread_id=thread_id,
-                actor="user",
-                content=user_text,
-                meta={
-                    "source": "cortexagent",
-                    "decision": decision_action,
-                    "tool_usage": {
-                        "tool": tool_name,
-                        "query": query,
-                    },
-                },
-                authorization=authorization,
-            )
-        except Exception:
-            pass
+        user_meta = {
+            "source": "cortexagent",
+            "decision": decision_action,
+            "tool_usage": {
+                "tool": tool_name,
+                "query": query,
+            },
+        }
+        self._add_event_with_retry(
+            thread_id=thread_id,
+            actor="user",
+            content=user_text,
+            meta=user_meta,
+            authorization=authorization,
+        )
 
         assistant_meta: dict[str, object] = {
             "source": f"cortexagent_{decision_action}",
@@ -267,16 +303,40 @@ class AgentOrchestrator:
                 **extra_meta,
             }
 
-        try:
-            self.ltm_client.add_event(
-                thread_id=thread_id,
-                actor="assistant",
-                content=assistant_text,
-                meta=assistant_meta,
-                authorization=authorization,
-            )
-        except Exception:
-            pass
+        self._add_event_with_retry(
+            thread_id=thread_id,
+            actor="assistant",
+            content=assistant_text,
+            meta=assistant_meta,
+            authorization=authorization,
+        )
+
+    def _add_event_with_retry(
+        self,
+        thread_id: str,
+        actor: str,
+        content: str,
+        meta: dict[str, object],
+        authorization: str | None,
+    ) -> None:
+        attempts = 0
+        last_error: Exception | None = None
+        while attempts < 2:
+            attempts += 1
+            try:
+                self.ltm_client.add_event(
+                    thread_id=thread_id,
+                    actor=actor,
+                    content=content,
+                    meta=meta,
+                    authorization=authorization,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(
+            f"Failed to persist {actor} event for tool response after retry: {last_error}"
+        )
 
     def _resolve_google_access_token(
         self, authorization: str | None
@@ -417,15 +477,52 @@ def _format_google_calendar_response(
             "I could not find upcoming events in your Google Calendar.",
             [],
         )
-    lines = ["Upcoming Google Calendar events:"]
+    if (
+        len(items) == 1
+        and isinstance(getattr(items[0], "title", None), str)
+        and str(getattr(items[0], "title", "")).strip().lower() == "confirmation required"
+    ):
+        snippet = (getattr(items[0], "snippet", "") or "").strip()
+        message = snippet or (
+            "Confirmation required before writing to Google Calendar. "
+            "Reply with 'confirm' to proceed or 'cancel' to stop."
+        )
+        return (
+            message,
+            [
+                {
+                    "title": "Google Calendar",
+                    "url": "https://calendar.google.com/",
+                    "snippet": "Write confirmation required",
+                }
+            ],
+        )
+
+    has_created = any(
+        isinstance(getattr(item, "title", None), str)
+        and str(getattr(item, "title", "")).startswith("[Created] ")
+        for item in items
+    )
+    lines = (
+        ["Google Calendar updated. Upcoming events:"]
+        if has_created
+        else ["Upcoming Google Calendar events:"]
+    )
     sources: list[dict[str, str]] = []
     for idx, item in enumerate(items[:8], start=1):
+        title = item.title
+        item_url = (item.url or "").strip() or "https://calendar.google.com/"
+        if title.startswith("[Created] "):
+            title = title.replace("[Created] ", "", 1) + " (created)"
         pretty_snippet = _normalize_calendar_snippet(item.snippet)
-        lines.append(f"{idx}. {item.title} - {pretty_snippet}")
+        line = f"{idx}. {title} - {pretty_snippet}"
+        if "(created)" in title:
+            line += f" | Link: {item_url}"
+        lines.append(line)
         sources.append(
             {
-                "title": item.title,
-                "url": "https://calendar.google.com/",
+                "title": title,
+                "url": item_url,
                 "snippet": pretty_snippet,
             }
         )
@@ -843,3 +940,180 @@ def _should_force_verification_web_search(user_text: str, reasons: list[str]) ->
     return "?" in text or text.startswith(
         ("what", "who", "when", "where", "how", "is", "are", "does", "do", "did", "can")
     )
+
+
+def _is_calendar_confirmation_required_items(items: list) -> bool:
+    if len(items) != 1:
+        return False
+    title = str(getattr(items[0], "title", "")).strip().lower()
+    return title == "confirmation required"
+
+
+def _is_calendar_created_items(items: list) -> bool:
+    for item in items:
+        title = str(getattr(item, "title", "")).strip()
+        if title.startswith("[Created] "):
+            return True
+    return False
+
+
+def _is_calendar_confirmation_reply(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith("confirm:") or lowered.startswith("confirm "):
+        return True
+    if re.search(r"\bi asked you to (add|create|schedule|book|set up|put)\b", lowered):
+        return True
+    if re.match(r"^\s*(please\s+)?(add|create|schedule|book|set up|put)\b", lowered):
+        return True
+    return bool(
+        re.match(
+            r"^\s*(yes|yep|yeah|ok|okay|go ahead|proceed|do it|sounds good)\b",
+            lowered,
+        )
+    )
+
+
+def _is_calendar_cancel_reply(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return bool(re.match(r"^\s*(no|cancel|stop|don't|do not)\b", lowered))
+
+
+def _build_confirmed_calendar_request(draft_text: str, followup_text: str) -> str:
+    followup = followup_text.strip()
+    lowered = followup.lower()
+    if lowered.startswith("confirm:"):
+        payload = followup.split(":", 1)[1].strip()
+        if payload:
+            return followup
+    elif lowered.startswith("confirm "):
+        payload = followup[len("confirm ") :].strip()
+        if payload:
+            return followup
+
+    draft_fields = _extract_calendar_fields(draft_text)
+    followup_fields = _extract_calendar_fields(followup_text)
+    merged = {
+        "title": followup_fields.get("title") or draft_fields.get("title"),
+        "day": followup_fields.get("day") or draft_fields.get("day"),
+        "time": followup_fields.get("time") or draft_fields.get("time"),
+        "location": followup_fields.get("location") or draft_fields.get("location"),
+    }
+    parts: list[str] = []
+    if merged["title"]:
+        parts.append(str(merged["title"]))
+    if merged["day"]:
+        parts.append(f"on {merged['day']}")
+    if merged["time"]:
+        parts.append(f"at {merged['time']}")
+    if merged["location"]:
+        parts.append(f"in {merged['location']}")
+    if not parts:
+        return f"confirm: {draft_text.strip()}"
+    return "confirm: " + " ".join(parts)
+
+
+def _extract_calendar_fields(text: str) -> dict[str, str]:
+    raw = text.strip()
+    lowered = text.strip().lower()
+    out: dict[str, str] = {}
+    title_line = re.search(r"(?im)^\s*-\s*title:\s*(.+?)\s*$", raw)
+    if title_line:
+        out["title"] = title_line.group(1).strip()
+    day_line = re.search(r"(?im)^\s*-\s*day:\s*(.+?)\s*$", raw)
+    if day_line:
+        out["day"] = day_line.group(1).strip()
+    time_line = re.search(r"(?im)^\s*-\s*time:\s*(.+?)\s*$", raw)
+    if time_line:
+        out["time"] = time_line.group(1).replace(" ", "").strip()
+    location_line = re.search(r"(?im)^\s*-\s*location:\s*(.+?)\s*$", raw)
+    if location_line:
+        out["location"] = location_line.group(1).strip()
+
+    if "title" not in out:
+        title_override = re.search(
+            r"\bchange\s+(?:the\s+)?title\s+to\s+(.+?)(?=(?:\s+(?:on|at|in)\b)|$)",
+            lowered,
+        )
+        if title_override:
+            out["title"] = _title_case_words(title_override.group(1))
+        else:
+            with_match = re.search(
+                r"\bwith\s+([a-z][a-z\s'-]{1,50}?)(?=\s+(?:on|at|in|and|for|its|it'?s|please|add|create|schedule|book)\b|[,.!?]|$)",
+                lowered,
+            )
+            if with_match:
+                out["title"] = "Meeting with " + _title_case_words(with_match.group(1))
+
+    if "day" not in out:
+        day_match = re.search(
+            r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            lowered,
+        )
+        if day_match:
+            out["day"] = day_match.group(1)
+        else:
+            date_match = re.search(
+                r"\b(?:"
+                r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+                r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+                r")\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b"
+                r"|"
+                r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
+                lowered,
+            )
+            if date_match:
+                out["day"] = date_match.group(0)
+
+    if "time" not in out:
+        time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lowered)
+        if time_match:
+            out["time"] = time_match.group(1).replace(" ", "")
+
+    if "location" not in out:
+        location_match = re.search(
+            r"\bin\s+([a-z][a-z\s,.'-]{1,60}?)(?=(?:\s+(?:on|at)\b)|$)",
+            lowered,
+        )
+        if location_match:
+            out["location"] = _title_case_words(location_match.group(1))
+    return out
+
+
+def _title_case_words(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", value.strip(" ."))
+    return " ".join(part.capitalize() for part in cleaned.split(" ") if part)
+
+
+def _extract_calendar_draft_text(items: list, fallback: str) -> str:
+    if len(items) == 1:
+        title = str(getattr(items[0], "title", "")).strip().lower()
+        if title == "confirmation required":
+            snippet = str(getattr(items[0], "snippet", "")).strip()
+            if snippet:
+                return snippet
+    return fallback
+
+
+def _prevent_unexecuted_calendar_write_claims(assistant_text: str, routed_action: str) -> str:
+    if routed_action == "google_calendar":
+        return assistant_text
+    lowered = (assistant_text or "").strip().lower()
+    if not lowered:
+        return assistant_text
+    mentions_calendar = "calendar" in lowered
+    claims_write = bool(
+        re.search(
+            r"\b(i(?:'ve| have)?\s+(added|scheduled|booked|put)|it(?:'s| is)\s+added|added your)\b",
+            lowered,
+        )
+    )
+    if mentions_calendar and claims_write:
+        return (
+            "I haven’t added anything to your Google Calendar yet. "
+            "I can do that through the calendar tool now if you want."
+        )
+    return assistant_text
