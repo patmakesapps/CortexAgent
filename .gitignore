@@ -5,7 +5,12 @@ __pycache__/
 
 # Env
 .env
+.env.*
+!.env.example
 .venv/
+.agent-venv/
+venv/
+venv*/
 
 # OS/editor
 .DS_Store
