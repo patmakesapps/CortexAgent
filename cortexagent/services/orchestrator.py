@@ -42,6 +42,7 @@ class AgentOrchestrator:
         self.connected_accounts_repo = connected_accounts_repo
         self.google_oauth = google_oauth
         self._pending_calendar_drafts: dict[str, str] = {}
+        self._pending_gmail_send_requests: dict[str, str] = {}
 
     def handle_chat(
         self,
@@ -51,6 +52,7 @@ class AgentOrchestrator:
         authorization: str | None,
     ) -> OrchestratorResult:
         pending_calendar_draft = self._pending_calendar_drafts.get(thread_id)
+        pending_gmail_send = self._pending_gmail_send_requests.get(thread_id)
         if pending_calendar_draft and _is_calendar_cancel_reply(text):
             self._pending_calendar_drafts.pop(thread_id, None)
             response = "Understood. I canceled this calendar draft and did not add anything."
@@ -63,12 +65,46 @@ class AgentOrchestrator:
                 ),
                 sources=[],
             )
+        if pending_gmail_send and _is_gmail_cancel_reply(text):
+            self._pending_gmail_send_requests.pop(thread_id, None)
+            response = "Understood. I canceled this Gmail send request and did not send anything."
+            return OrchestratorResult(
+                response=response,
+                decision=AgentDecision(
+                    action="google_gmail",
+                    reason="gmail_send_canceled",
+                    confidence=1.0,
+                ),
+                sources=[],
+            )
+        if not pending_calendar_draft and _is_standalone_calendar_confirmation_reply(text):
+            response = (
+                "I don't have a pending calendar draft to confirm right now. "
+                "Tell me the event details, and I'll draft it for your approval."
+            )
+            return OrchestratorResult(
+                response=response,
+                decision=AgentDecision(
+                    action="google_calendar",
+                    reason="calendar_confirmation_missing_draft",
+                    confidence=1.0,
+                ),
+                sources=[],
+            )
 
         verification = assess_verification_profile(text)
-        if pending_calendar_draft and _is_calendar_confirmation_reply(text):
+        if pending_calendar_draft and (
+            _is_calendar_confirmation_reply(text) or _is_calendar_draft_edit_reply(text)
+        ):
             route = RouteDecision(
                 action="google_calendar",
                 reason="calendar_confirmation_followup",
+                confidence=0.99,
+            )
+        elif pending_gmail_send and _is_gmail_send_confirmation_reply(text):
+            route = RouteDecision(
+                action="google_gmail",
+                reason="gmail_send_confirmation_followup",
                 confidence=0.99,
             )
         else:
@@ -90,7 +126,7 @@ class AgentOrchestrator:
                 confidence=max(route.confidence, 0.9),
             )
 
-        if route.action not in {"web_search", "google_calendar"}:
+        if route.action not in {"web_search", "google_calendar", "google_gmail"}:
             assistant_text = self.ltm_client.chat(
                 thread_id=thread_id,
                 text=text,
@@ -125,12 +161,28 @@ class AgentOrchestrator:
                     draft_text=pending_calendar_draft,
                     followup_text=text,
                 )
+            elif pending_calendar_draft and _is_calendar_draft_edit_reply(text):
+                effective_calendar_text = _build_updated_calendar_draft_request(
+                    draft_text=pending_calendar_draft,
+                    followup_text=text,
+                )
             try:
                 access_token, token_meta = self._resolve_google_access_token(
-                    authorization=authorization
+                    authorization=authorization,
+                    integration_label="Google Calendar",
                 )
             except Exception as exc:
                 assistant_text = str(exc)
+                self._persist_nonfatal_tool_error_events(
+                    thread_id=thread_id,
+                    user_text=text,
+                    assistant_text=assistant_text,
+                    query=effective_calendar_text,
+                    authorization=authorization,
+                    decision_action="google_calendar",
+                    tool_name="google_calendar",
+                    capability_label="Google Calendar",
+                )
                 return OrchestratorResult(
                     response=assistant_text,
                     decision=AgentDecision(
@@ -156,6 +208,16 @@ class AgentOrchestrator:
                 assistant_text = (
                     "I routed this request to Google Calendar, but the request failed. "
                     f"Error: {exc}"
+                )
+                self._persist_nonfatal_tool_error_events(
+                    thread_id=thread_id,
+                    user_text=text,
+                    assistant_text=assistant_text,
+                    query=effective_calendar_text,
+                    authorization=authorization,
+                    decision_action="google_calendar",
+                    tool_name="google_calendar",
+                    capability_label="Google Calendar",
                 )
                 return OrchestratorResult(
                     response=assistant_text,
@@ -197,6 +259,114 @@ class AgentOrchestrator:
                 sources=sources,
             )
 
+        if route.action == "google_gmail":
+            tool = self.tool_registry.get("google_gmail")
+            effective_gmail_text = text
+            if pending_gmail_send and _is_gmail_send_confirmation_reply(text):
+                effective_gmail_text = _build_confirmed_gmail_send_request(
+                    pending_text=pending_gmail_send,
+                    followup_text=text,
+                )
+            try:
+                access_token, token_meta = self._resolve_google_access_token(
+                    authorization=authorization,
+                    integration_label="Gmail",
+                )
+            except Exception as exc:
+                assistant_text = str(exc)
+                self._persist_nonfatal_tool_error_events(
+                    thread_id=thread_id,
+                    user_text=text,
+                    assistant_text=assistant_text,
+                    query=effective_gmail_text,
+                    authorization=authorization,
+                    decision_action="google_gmail",
+                    tool_name="google_gmail",
+                    capability_label="Gmail",
+                )
+                return OrchestratorResult(
+                    response=assistant_text,
+                    decision=AgentDecision(
+                        action="google_gmail",
+                        reason="google_gmail_auth_failed",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+
+            allowed_domains = [
+                value.strip().lower()
+                for value in settings.gmail_allowed_recipient_domains.split(",")
+                if value.strip()
+            ]
+
+            try:
+                result = tool.run(
+                    ToolContext(
+                        thread_id=thread_id,
+                        user_text=effective_gmail_text,
+                        tool_meta={
+                            "access_token": access_token,
+                            "max_results": 8,
+                            "allowed_recipient_domains": allowed_domains,
+                        },
+                    )
+                )
+            except Exception as exc:
+                assistant_text = (
+                    "I routed this request to Gmail, but the request failed. "
+                    f"Error: {exc}"
+                )
+                self._persist_nonfatal_tool_error_events(
+                    thread_id=thread_id,
+                    user_text=text,
+                    assistant_text=assistant_text,
+                    query=effective_gmail_text,
+                    authorization=authorization,
+                    decision_action="google_gmail",
+                    tool_name="google_gmail",
+                    capability_label="Gmail",
+                )
+                return OrchestratorResult(
+                    response=assistant_text,
+                    decision=AgentDecision(
+                        action="google_gmail",
+                        reason="google_gmail_failed",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+
+            assistant_text, sources = _format_google_gmail_response(result.items)
+            if _is_gmail_send_confirmation_required_items(result.items):
+                self._pending_gmail_send_requests[thread_id] = _extract_gmail_send_pending_text(
+                    items=result.items,
+                    fallback=effective_gmail_text,
+                )
+            elif _is_gmail_sent_items(result.items):
+                self._pending_gmail_send_requests.pop(thread_id, None)
+            self._persist_tool_events(
+                thread_id=thread_id,
+                user_text=text,
+                assistant_text=assistant_text,
+                tool_name=result.tool_name,
+                query=result.query,
+                sources=sources,
+                authorization=authorization,
+                decision_action=route.action,
+                capability_label="Gmail",
+                extra_meta=token_meta,
+            )
+            return OrchestratorResult(
+                response=assistant_text,
+                decision=AgentDecision(
+                    action=route.action,
+                    reason=route.reason,
+                    confidence=route.confidence,
+                ),
+                sources=sources,
+            )
+
         tool = self.tool_registry.get("web_search")
         try:
             result = tool.run(ToolContext(thread_id=thread_id, user_text=text))
@@ -204,6 +374,16 @@ class AgentOrchestrator:
             assistant_text = (
                 "I routed this request to web search, but the search providers failed. "
                 f"Error: {exc}"
+            )
+            self._persist_nonfatal_tool_error_events(
+                thread_id=thread_id,
+                user_text=text,
+                assistant_text=assistant_text,
+                query=text,
+                authorization=authorization,
+                decision_action="web_search",
+                tool_name="web_search",
+                capability_label="Web Search",
             )
             return OrchestratorResult(
                 response=assistant_text,
@@ -338,13 +518,42 @@ class AgentOrchestrator:
             f"Failed to persist {actor} event for tool response after retry: {last_error}"
         )
 
+    def _persist_nonfatal_tool_error_events(
+        self,
+        thread_id: str,
+        user_text: str,
+        assistant_text: str,
+        query: str,
+        authorization: str | None,
+        decision_action: str,
+        tool_name: str,
+        capability_label: str,
+    ) -> None:
+        try:
+            self._persist_tool_events(
+                thread_id=thread_id,
+                user_text=user_text,
+                assistant_text=assistant_text,
+                tool_name=tool_name,
+                query=query,
+                sources=[],
+                authorization=authorization,
+                decision_action=decision_action,
+                capability_label=capability_label,
+            )
+        except Exception:
+            # Keep tool failure response path resilient even if event persistence is unavailable.
+            return
+
     def _resolve_google_access_token(
-        self, authorization: str | None
+        self,
+        authorization: str | None,
+        integration_label: str,
     ) -> tuple[str, dict[str, object]]:
         if not self.connected_accounts_repo or not self.google_oauth:
-            raise RuntimeError("Google Calendar is currently unavailable.")
+            raise RuntimeError(f"{integration_label} is currently unavailable.")
         if not authorization:
-            raise RuntimeError("Please sign in, then reconnect Google Calendar.")
+            raise RuntimeError(f"Please sign in, then reconnect {integration_label}.")
 
         user_id = resolve_user_id_from_authorization(
             authorization=authorization,
@@ -357,7 +566,7 @@ class AgentOrchestrator:
         )
         if resolved is None:
             raise RuntimeError(
-                "Google Calendar is not connected. Use Connect Google in Settings first."
+                f"{integration_label} is not connected. Use Connect Google in Settings first."
             )
         if resolved.access_token and not resolved.is_access_token_expired:
             return (
@@ -373,14 +582,14 @@ class AgentOrchestrator:
         if not resolved.refresh_token:
             raise RuntimeError(
                 "Google connection expired and cannot refresh automatically. "
-                "Please reconnect Google Calendar."
+                f"Please reconnect {integration_label}."
             )
         try:
             refreshed = self.google_oauth.refresh_access_token(resolved.refresh_token)
         except Exception as exc:
             raise RuntimeError(
                 "Google authorization expired and refresh failed. "
-                "Please reconnect Google Calendar."
+                f"Please reconnect {integration_label}."
             ) from exc
 
         next_refresh = refreshed.refresh_token or resolved.refresh_token
@@ -531,6 +740,60 @@ def _format_google_calendar_response(
     return ("\n".join(lines), sources)
 
 
+def _format_google_gmail_response(
+    items: list,
+) -> tuple[str, list[dict[str, str]]]:
+    if not items:
+        return ("I could not find Gmail results for that request.", [])
+
+    if (
+        len(items) == 1
+        and str(getattr(items[0], "title", "")).strip().lower()
+        == "send confirmation required"
+    ):
+        snippet = str(getattr(items[0], "snippet", "")).strip()
+        return (
+            snippet
+            or "Confirmation required before sending Gmail draft. Reply with confirm or cancel.",
+            [
+                {
+                    "title": "Gmail",
+                    "url": "https://mail.google.com/",
+                    "snippet": "Send confirmation required",
+                }
+            ],
+        )
+
+    has_send = any(
+        str(getattr(item, "title", "")).strip().lower().startswith("[sent]")
+        for item in items
+    )
+    has_draft = any(
+        str(getattr(item, "title", "")).strip().lower().startswith("[drafted]")
+        for item in items
+    )
+    if has_send:
+        lines = ["Gmail sent successfully:"]
+    elif has_draft:
+        lines = ["Gmail draft created:"]
+    else:
+        lines = ["Gmail results:"]
+
+    sources: list[dict[str, str]] = []
+    for idx, item in enumerate(items[:8], start=1):
+        lines.append(f"{idx}. {item.title} - {item.snippet}")
+        sources.append(
+            {
+                "title": str(getattr(item, "title", "")).strip() or "Gmail result",
+                "url": str(getattr(item, "url", "")).strip() or "https://mail.google.com/",
+                "snippet": str(getattr(item, "snippet", "")).strip(),
+            }
+        )
+    lines.append("Sources:")
+    lines.append("- Gmail: https://mail.google.com/")
+    return ("\n".join(lines), sources)
+
+
 def _normalize_calendar_snippet(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
@@ -557,7 +820,6 @@ def _humanize_calendar_time_label(label: str) -> str:
     except ValueError:
         return f"Starts: {value}"
     if parsed.tzinfo is not None:
-        parsed = parsed.astimezone()
         stamp = parsed.strftime("%a, %b %d at %I:%M %p").replace(" 0", " ")
         return f"Starts: {stamp}"
     stamp = parsed.strftime("%a, %b %d (all day)").replace(" 0", " ")
@@ -959,9 +1221,26 @@ def _is_calendar_created_items(items: list) -> bool:
 
 def _is_calendar_confirmation_reply(text: str) -> bool:
     lowered = text.strip().lower()
-    if not lowered:
+    normalized = _normalize_short_reply_text(text)
+    if not normalized:
         return False
-    if lowered.startswith("confirm:") or lowered.startswith("confirm "):
+    if normalized in {
+        "confirm",
+        "yes",
+        "yea",
+        "ya",
+        "yep",
+        "yeah",
+        "ok",
+        "okay",
+        "sure",
+        "go ahead",
+        "proceed",
+        "do it",
+        "sounds good",
+    }:
+        return True
+    if normalized.startswith("confirm:") or normalized.startswith("confirm "):
         return True
     if re.search(r"\bi asked you to (add|create|schedule|book|set up|put)\b", lowered):
         return True
@@ -975,11 +1254,154 @@ def _is_calendar_confirmation_reply(text: str) -> bool:
     )
 
 
+def _is_standalone_calendar_confirmation_reply(text: str) -> bool:
+    normalized = _normalize_short_reply_text(text)
+    return normalized in {
+        "confirm",
+        "yes",
+        "yea",
+        "ya",
+        "yep",
+        "yeah",
+        "ok",
+        "okay",
+        "sure",
+        "go ahead",
+        "proceed",
+        "do it",
+        "sounds good",
+        "add it",
+        "add it to calendar",
+    }
+
+
 def _is_calendar_cancel_reply(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return False
     return bool(re.match(r"^\s*(no|cancel|stop|don't|do not)\b", lowered))
+
+
+def _is_calendar_draft_edit_reply(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    if _is_calendar_confirmation_reply(text) or _is_calendar_cancel_reply(text):
+        return False
+
+    if re.search(
+        r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        r"\b(?:"
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+        r")\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b"
+        r"|"
+        r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
+        lowered,
+    ):
+        return True
+    if re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", lowered):
+        return True
+    if re.search(
+        r"\b(change|update|instead|not|move|shift|title|location|zoom|meet\.?|teams?)\b",
+        lowered,
+    ):
+        return True
+    return False
+
+
+def _build_updated_calendar_draft_request(draft_text: str, followup_text: str) -> str:
+    draft_fields = _extract_calendar_fields(draft_text)
+    followup_fields = _extract_calendar_fields(followup_text)
+    merged = {
+        "title": followup_fields.get("title") or draft_fields.get("title"),
+        "day": followup_fields.get("day") or draft_fields.get("day"),
+        "time": followup_fields.get("time") or draft_fields.get("time"),
+        "location": followup_fields.get("location") or draft_fields.get("location"),
+    }
+    parts: list[str] = []
+    if merged["title"]:
+        parts.append(str(merged["title"]))
+    if merged["day"]:
+        parts.append(f"on {merged['day']}")
+    if merged["time"]:
+        parts.append(f"at {merged['time']}")
+    if merged["location"]:
+        parts.append(f"in {merged['location']}")
+    if not parts:
+        return draft_text.strip()
+    return "add event " + " ".join(parts)
+
+
+def _is_gmail_send_confirmation_reply(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    if lowered == "confirm":
+        return True
+    return bool(
+        lowered.startswith("confirm send")
+        or lowered.startswith("confirm: send")
+        or "yes, send draft" in lowered
+        or "yes send draft" in lowered
+        or re.match(r"^\s*(yes|ok|okay|go ahead|proceed)\b", lowered)
+    )
+
+
+def _is_gmail_cancel_reply(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return bool(re.match(r"^\s*(no|cancel|stop|don't|do not)\b", lowered))
+
+
+def _build_confirmed_gmail_send_request(pending_text: str, followup_text: str) -> str:
+    followup = followup_text.strip()
+    lowered = followup.lower()
+    if lowered.startswith("confirm send") or lowered.startswith("confirm: send"):
+        return followup
+    draft_id = _extract_draft_id_for_confirmation(pending_text)
+    if not draft_id:
+        draft_id = _extract_draft_id_for_confirmation(followup_text)
+    if not draft_id:
+        return "confirm send draft"
+    return f"confirm send draft {draft_id}"
+
+
+def _extract_draft_id_for_confirmation(text: str) -> str | None:
+    match = re.search(r"\bdraft(?:\s+id)?\s*[:#]?\s*([a-z0-9_-]{4,})\b", text, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _is_gmail_send_confirmation_required_items(items: list) -> bool:
+    if len(items) != 1:
+        return False
+    title = str(getattr(items[0], "title", "")).strip().lower()
+    return title == "send confirmation required"
+
+
+def _is_gmail_sent_items(items: list) -> bool:
+    for item in items:
+        title = str(getattr(item, "title", "")).strip().lower()
+        if title.startswith("[sent]"):
+            return True
+    return False
+
+
+def _extract_gmail_send_pending_text(items: list, fallback: str) -> str:
+    if len(items) == 1:
+        title = str(getattr(items[0], "title", "")).strip().lower()
+        if title == "send confirmation required":
+            snippet = str(getattr(items[0], "snippet", "")).strip()
+            if snippet:
+                return snippet
+    return fallback
 
 
 def _build_confirmed_calendar_request(draft_text: str, followup_text: str) -> str:
@@ -1013,7 +1435,7 @@ def _build_confirmed_calendar_request(draft_text: str, followup_text: str) -> st
         parts.append(f"in {merged['location']}")
     if not parts:
         return f"confirm: {draft_text.strip()}"
-    return "confirm: " + " ".join(parts)
+    return "confirm: add event " + " ".join(parts)
 
 
 def _extract_calendar_fields(text: str) -> dict[str, str]:
@@ -1050,11 +1472,12 @@ def _extract_calendar_fields(text: str) -> dict[str, str]:
 
     if "day" not in out:
         day_match = re.search(
-            r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            r"\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
             lowered,
         )
         if day_match:
-            out["day"] = day_match.group(1)
+            token = day_match.group(1)
+            out["day"] = "today" if token == "tonight" else token
         else:
             date_match = re.search(
                 r"\b(?:"
@@ -1080,12 +1503,27 @@ def _extract_calendar_fields(text: str) -> dict[str, str]:
         )
         if location_match:
             out["location"] = _title_case_words(location_match.group(1))
+        else:
+            at_location_match = re.search(
+                r"\bat\s+([a-z][a-z\s,.'-]{1,60}?)(?=(?:\s+(?:on|in)\b)|$)",
+                lowered,
+            )
+            if at_location_match:
+                out["location"] = _title_case_words(at_location_match.group(1))
     return out
 
 
 def _title_case_words(value: str) -> str:
     cleaned = re.sub(r"\s+", " ", value.strip(" ."))
     return " ".join(part.capitalize() for part in cleaned.split(" ") if part)
+
+
+def _normalize_short_reply_text(text: str) -> str:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return ""
+    cleaned = re.sub(r"[.!?]+$", "", lowered)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _extract_calendar_draft_text(items: list, fallback: str) -> str:

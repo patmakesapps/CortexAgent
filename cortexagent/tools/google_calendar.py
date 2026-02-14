@@ -32,8 +32,10 @@ class GoogleCalendarTool(Tool):
 
         token = access_token.strip()
         items: list[ToolResultItem] = []
-        if _is_create_intent(context.user_text):
-            if not _has_explicit_write_confirmation(context.user_text):
+        is_create_intent = _is_create_intent(context.user_text)
+        has_confirmation = _has_explicit_write_confirmation(context.user_text)
+        if is_create_intent or has_confirmation:
+            if not has_confirmation:
                 return ToolResult(
                     tool_name=self.name,
                     query=context.user_text.strip(),
@@ -169,8 +171,6 @@ def _event_time_label(start: object) -> str:
             normalized = normalized[:-1] + "+00:00"
         try:
             parsed = datetime.fromisoformat(normalized)
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone()
             return "Starts: " + parsed.strftime("%a, %b %d at %I:%M %p").replace(
                 " 0", " "
             )
@@ -245,9 +245,18 @@ def _strip_confirmation_prefix(text: str) -> str:
         return cleaned
     lowered = cleaned.lower()
     if lowered.startswith("confirm:"):
-        return cleaned[len("confirm:") :].strip()
-    if lowered.startswith("confirm "):
-        return cleaned[len("confirm ") :].strip()
+        cleaned = cleaned[len("confirm:") :].strip()
+    elif lowered.startswith("confirm "):
+        cleaned = cleaned[len("confirm ") :].strip()
+
+    # Help Google quickAdd parse natural event text instead of command-style prompts.
+    cleaned = re.sub(
+        r"^(?:please\s+)?(?:add|create|schedule|book|set up)\s+"
+        r"(?:an?\s+)?(?:event|meeting|appointment|call)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
     return cleaned
 
 
@@ -264,7 +273,7 @@ def _build_confirmation_prompt(text: str) -> str:
         subject = "Meeting with " + " ".join(part.capitalize() for part in person.split())
 
     day_match = re.search(
-        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)\b",
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|tonight)\b",
         lowered,
     )
     concrete_date_match = re.search(
@@ -286,7 +295,7 @@ def _build_confirmation_prompt(text: str) -> str:
             day = _closest_future_day_label(preferred_weekday=_WEEKDAY_TO_INDEX[day_token])
             assumed_day = True
             assumed_day_note = f"closest upcoming {day_token.capitalize()}"
-        elif day_token == "today":
+        elif day_token in {"today", "tonight"}:
             day = datetime.now().astimezone().strftime("%A, %b %d, %Y")
         else:
             day = (datetime.now().astimezone() + timedelta(days=1)).strftime(
@@ -312,6 +321,16 @@ def _build_confirmation_prompt(text: str) -> str:
             time_value = time_value[:-2] + ":00" + time_value[-2:]
         time_value = time_value[:-2] + " " + time_value[-2:]
 
+    location_value = ""
+    location_match = re.search(
+        r"\b(?:at|in)\s+([a-z][a-z0-9&'.,\-\s]{1,60}?)(?=$|[,.!?])",
+        lowered,
+    )
+    if location_match:
+        candidate = re.sub(r"\s+", " ", location_match.group(1)).strip(" .")
+        if candidate and not re.match(r"^\d{1,2}(?::\d{2})?\s*(?:am|pm)$", candidate):
+            location_value = " ".join(part.capitalize() for part in candidate.split())
+
     assumption_lines: list[str] = []
     if assumed_day:
         assumption_lines.append(
@@ -324,11 +343,13 @@ def _build_confirmation_prompt(text: str) -> str:
     if assumption_lines:
         assumption_block = "\nAssumptions to confirm: " + " ".join(assumption_lines)
 
+    location_line = f"- Location: {location_value}\n" if location_value else ""
     return (
         "I have this draft event:\n"
         f"- Title: {subject}\n"
         f"- Day: {day}\n"
         f"- Time: {time_value}\n"
+        f"{location_line}"
         f"{assumption_block}\n"
         "Should I add this to Google Calendar? "
         "Reply with 'confirm' to proceed or 'cancel' to stop."

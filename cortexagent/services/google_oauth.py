@@ -27,6 +27,7 @@ class GoogleTokenExchange:
 class GoogleOAuthService:
     TOKEN_URL = "https://oauth2.googleapis.com/token"
     USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+    TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 
     def __init__(
         self,
@@ -67,6 +68,11 @@ class GoogleOAuthService:
         expires_at = None
         if isinstance(token.expires_in, int) and token.expires_in > 0:
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=token.expires_in)
+        resolved_scope = token.scope
+        if not resolved_scope:
+            resolved_scope = self.fetch_token_scope(token.access_token)
+        if not resolved_scope and existing:
+            resolved_scope = existing.scope
 
         account = repo.upsert_active_account(
             ConnectedAccountUpsert(
@@ -76,7 +82,7 @@ class GoogleOAuthService:
                 access_token=token.access_token,
                 refresh_token=token.refresh_token or (existing.refresh_token if existing else None),
                 token_type=token.token_type,
-                scope=token.scope,
+                scope=resolved_scope,
                 expires_at=expires_at,
                 status="active",
                 meta={
@@ -132,6 +138,19 @@ class GoogleOAuthService:
             scope=_opt_str(payload.get("scope")),
             expires_in=expires_in,
         )
+
+    def fetch_token_scope(self, access_token: str) -> str | None:
+        response = requests.get(
+            self.TOKENINFO_URL,
+            params={"access_token": access_token},
+            timeout=self.timeout_seconds,
+        )
+        if not response.ok:
+            return None
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        return _opt_str(payload.get("scope"))
 
     def exchange_code(
         self, code: str, code_verifier: str | None = None

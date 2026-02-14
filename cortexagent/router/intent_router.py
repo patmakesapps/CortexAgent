@@ -66,6 +66,22 @@ GOOGLE_CALENDAR_TERMS = (
     "put on my calendar",
 )
 
+GOOGLE_GMAIL_TERMS = (
+    "gmail",
+    "email",
+    "inbox",
+    "recent threads",
+    "recent emails",
+    "read message",
+    "read email",
+    "open email",
+    "open message",
+    "draft reply",
+    "draft email",
+    "compose reply",
+    "send draft",
+)
+
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -82,11 +98,23 @@ def _keyword_decision(user_text: str) -> RouteDecision:
             reason="matched_explicit_google_calendar_write_intent",
             confidence=0.97,
         )
+    if _matches_explicit_gmail_intent(text):
+        return RouteDecision(
+            action="google_gmail",
+            reason="matched_google_gmail_intent",
+            confidence=0.95,
+        )
     if any(term in text for term in GOOGLE_CALENDAR_TERMS):
         return RouteDecision(
             action="google_calendar",
             reason="matched_google_calendar_intent",
             confidence=0.93,
+        )
+    if any(term in text for term in GOOGLE_GMAIL_TERMS):
+        return RouteDecision(
+            action="google_gmail",
+            reason="matched_google_gmail_term",
+            confidence=0.92,
         )
     if any(term in text for term in EXPLICIT_WEB_INTENT_TERMS):
         return RouteDecision(
@@ -126,6 +154,16 @@ def _matches_explicit_calendar_write_intent(text: str) -> bool:
     return bool(pattern.search(text))
 
 
+def _matches_explicit_gmail_intent(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(r"\b(read|open|show|list)\b.*\b(email|inbox|thread|message)\b", text)
+        or re.search(r"\b(draft|compose|write)\b.*\b(reply|email)\b", text)
+        or re.search(r"\bsend\b.*\bdraft\b", text)
+    )
+
+
 def _extract_json(content: str) -> dict[str, object]:
     cleaned = content.strip()
     if cleaned.startswith("```"):
@@ -149,6 +187,7 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
         "Choose one action for the user request:\n"
         "- web_search: requires current/external/verifiable web data\n"
         "- google_calendar: user asks about their own schedule/events/calendar\n"
+        "- google_gmail: user asks about their own inbox/threads/messages/drafts\n"
         "- chat: answer directly from internal reasoning/knowledge\n\n"
         "Rules:\n"
         "- Prefer web_search for time-sensitive facts (news, prices, weather, sports, schedules, releases, laws, policies, outages, version changes).\n"
@@ -156,9 +195,10 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
         "- Prefer chat for timeless concepts, creative writing, coding help, editing, translation, and personal advice.\n"
         "- Keywords are hints, not the source of truth.\n"
         "- If user clearly refers to their personal calendar/events/schedule, prefer google_calendar.\n"
+        "- If user clearly refers to their inbox/emails/threads/drafts, prefer google_gmail.\n"
         "- Return strict JSON only.\n\n"
         "Output schema:\n"
-        '{"action":"web_search|google_calendar|chat","reason":"short_reason","confidence":0.0}'
+        '{"action":"web_search|google_calendar|google_gmail|chat","reason":"short_reason","confidence":0.0}'
     )
 
     payload = {
@@ -202,7 +242,7 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
     except Exception:
         return None
 
-    if action not in {"chat", "web_search", "google_calendar"}:
+    if action not in {"chat", "web_search", "google_calendar", "google_gmail"}:
         return None
     if confidence < 0.0:
         confidence = 0.0
@@ -224,6 +264,12 @@ def decide_action(user_text: str, tools_enabled: bool, web_search_enabled: bool)
             action="google_calendar",
             reason="matched_explicit_google_calendar_write_intent",
             confidence=0.97,
+        )
+    if _matches_explicit_gmail_intent(text):
+        return RouteDecision(
+            action="google_gmail",
+            reason="matched_google_gmail_intent",
+            confidence=0.95,
         )
 
     if web_search_enabled:

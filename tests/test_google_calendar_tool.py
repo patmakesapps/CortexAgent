@@ -46,6 +46,20 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
         self.assertIn("I assumed the time: 09:00 AM.", result.items[0].snippet)
         self.assertIn("Assumptions to confirm:", result.items[0].snippet)
 
+    def test_tonight_resolves_to_today_and_keeps_location(self):
+        tool = GoogleCalendarTool()
+        result = tool.run(
+            ToolContext(
+                thread_id="thread-1",
+                user_text="i have a date with my wife tonight at 8pm at wild rabbit add it to calendar",
+                tool_meta={"access_token": "token-1"},
+            )
+        )
+        self.assertEqual(result.items[0].title, "Confirmation required")
+        self.assertNotIn("closest upcoming day in the future", result.items[0].snippet)
+        self.assertIn("- Time: 8:00 PM", result.items[0].snippet)
+        self.assertIn("- Location: Wild Rabbit", result.items[0].snippet)
+
     def test_title_extraction_stops_before_trailing_instruction_words(self):
         tool = GoogleCalendarTool()
         result = tool.run(
@@ -116,6 +130,65 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
             )
 
         self.assertEqual(result.items[0].title, "[Created] Project Sync")
+        quick_add_mock.assert_called_once()
+        list_mock.assert_called_once()
+
+    def test_confirm_strips_command_prefix_before_quick_add(self):
+        tool = GoogleCalendarTool()
+        with patch.object(
+            tool,
+            "_quick_add_event",
+            return_value=ToolResultItem(
+                title="[Created] Dinner",
+                url="https://calendar.google.com/",
+                snippet="Created event | Starts: Sat, Feb 14 at 08:00 PM",
+            ),
+        ) as quick_add_mock, patch.object(
+            tool,
+            "_list_upcoming_events",
+            return_value=[],
+        ):
+            tool.run(
+                ToolContext(
+                    thread_id="thread-1",
+                    user_text=(
+                        "confirm: add event Meeting with My Wife Tonight on Saturday, Feb 14, 2026 "
+                        "at 8:00PM in Wild Rabbit"
+                    ),
+                    tool_meta={"access_token": "token-1"},
+                )
+            )
+        self.assertEqual(
+            quick_add_mock.call_args.kwargs["event_text"],
+            "Meeting with My Wife Tonight on Saturday, Feb 14, 2026 at 8:00PM in Wild Rabbit",
+        )
+
+    def test_confirmed_draft_text_without_add_keyword_executes_write(self):
+        tool = GoogleCalendarTool()
+        with patch.object(
+            tool,
+            "_quick_add_event",
+            return_value=ToolResultItem(
+                title="[Created] Meeting with Jim",
+                url="https://calendar.google.com/",
+                snippet="Created event | Starts: Sat, Feb 14 at 08:00 PM",
+            ),
+        ) as quick_add_mock, patch.object(
+            tool,
+            "_list_upcoming_events",
+            return_value=[],
+        ) as list_mock:
+            result = tool.run(
+                ToolContext(
+                    thread_id="thread-1",
+                    user_text=(
+                        "confirm: Meeting with Jim on Saturday, Feb 14, 2026 at 8:00PM in Wild Rabbit"
+                    ),
+                    tool_meta={"access_token": "token-1"},
+                )
+            )
+
+        self.assertEqual(result.items[0].title, "[Created] Meeting with Jim")
         quick_add_mock.assert_called_once()
         list_mock.assert_called_once()
 

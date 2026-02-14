@@ -86,14 +86,28 @@ class ConnectedAccountsRepository:
             return None
         return rows[0]
 
+    def get_active_accounts(
+        self,
+        user_id: str,
+        provider: str,
+    ) -> list[ConnectedAccount]:
+        return self._fetch_accounts(
+            user_id=user_id,
+            provider=provider,
+            provider_account_id=None,
+            only_active=True,
+            limit=None,
+        )
+
     def has_active_account(self, user_id: str, provider: str) -> bool:
         return self.get_active_account(user_id=user_id, provider=provider) is not None
 
     def disconnect_provider(self, user_id: str, provider: str) -> bool:
-        account = self.get_active_account(user_id=user_id, provider=provider)
-        if account is None:
+        accounts = self.get_active_accounts(user_id=user_id, provider=provider)
+        if not accounts:
             return False
-        self.soft_delete_account(account.id)
+        for account in accounts:
+            self.soft_delete_account(account.id)
         return True
 
     def upsert_active_account(self, payload: ConnectedAccountUpsert) -> ConnectedAccount:
@@ -164,6 +178,7 @@ class ConnectedAccountsRepository:
         provider: str,
         provider_account_id: str | None,
         only_active: bool,
+        limit: int | None = 1,
     ) -> list[ConnectedAccount]:
         self._ensure_configured()
         url = self._table_url()
@@ -176,8 +191,9 @@ class ConnectedAccountsRepository:
             "provider": f"eq.{provider.strip().lower()}",
             "deleted_at": "is.null",
             "order": "updated_at.desc",
-            "limit": "1",
         }
+        if isinstance(limit, int) and limit > 0:
+            params["limit"] = str(limit)
         if only_active:
             params["status"] = "eq.active"
         if provider_account_id:

@@ -7,6 +7,7 @@ v1 goal:
 - Trigger web search when the user asks for current/external information
 - Persist both user and assistant messages to CortexLTM even when tools are used
 - Support Google Calendar read + write flows with explicit user confirmation
+- Support Gmail list/read/draft flows, plus confirmation-gated send
 
 ## Release Notes (Feb 14, 2026)
 
@@ -27,6 +28,13 @@ v1 goal:
   - created entries include direct Google Calendar event links when available
 - Added anti-hallucination safety for calendar writes:
   - chat-only responses are prevented from claiming an event was added unless calendar tooling executed
+- Added Gmail tool support:
+  - list recent inbox threads
+  - read latest email or a specific `thread <id>`
+  - draft replies to a thread
+  - send drafts only after explicit confirmation
+  - optional recipient-domain policy via `GMAIL_ALLOWED_RECIPIENT_DOMAINS`
+  - prompt-injection line filtering on email content previews
 
 ## Architecture
 
@@ -40,6 +48,8 @@ v1 goal:
   - Web search tool with provider abstraction
 - `cortexagent/tools/google_calendar.py`
   - Google Calendar list + create logic (confirmation-gated writes)
+- `cortexagent/tools/google_gmail.py`
+  - Gmail thread list/read, draft-reply, and confirmation-gated send
 - `cortexagent/services/cortexltm_client.py`
   - HTTP client for CortexLTM endpoints
 - `cortexagent/services/orchestrator.py`
@@ -110,6 +120,7 @@ Optional:
 - `GOOGLE_CLIENT_SECRET` (required for Google OAuth code exchange)
 - `GOOGLE_REDIRECT_URI` (must exactly match Google OAuth client redirect URI)
 - `GOOGLE_OAUTH_TIMEOUT_SECONDS` (default `8`)
+- `GMAIL_ALLOWED_RECIPIENT_DOMAINS` (optional comma-separated allowlist for send safety, e.g. `gmail.com,company.com`)
 
 ## Route
 

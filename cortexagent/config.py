@@ -51,6 +51,7 @@ class Settings:
     google_client_secret: str | None
     google_redirect_uri: str | None
     google_oauth_timeout_seconds: int
+    gmail_allowed_recipient_domains: str
 
 
 def load_settings() -> Settings:
@@ -93,6 +94,7 @@ def load_settings() -> Settings:
         google_oauth_timeout_seconds=_as_int(
             os.getenv("GOOGLE_OAUTH_TIMEOUT_SECONDS"), 8
         ),
+        gmail_allowed_recipient_domains=os.getenv("GMAIL_ALLOWED_RECIPIENT_DOMAINS", ""),
     )
 
 

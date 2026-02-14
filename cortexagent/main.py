@@ -1,3 +1,5 @@
+import re
+
 from fastapi import FastAPI, Header, HTTPException
 
 from cortexagent.config import settings
@@ -10,12 +12,13 @@ from cortexagent.models import (
 )
 from cortexagent.services import (
     AgentOrchestrator,
+    ConnectedAccountUpsert,
     ConnectedAccountsRepository,
     CortexLTMClient,
     GoogleOAuthService,
     resolve_user_id_from_authorization,
 )
-from cortexagent.tools import GoogleCalendarTool, ToolRegistry, WebSearchTool
+from cortexagent.tools import GoogleCalendarTool, GoogleGmailTool, ToolRegistry, WebSearchTool
 
 app = FastAPI(title="CortexAgent", version="0.1.0")
 
@@ -25,6 +28,7 @@ def _build_orchestrator() -> AgentOrchestrator:
     if settings.web_search_enabled:
         registry.register(WebSearchTool())
     registry.register(GoogleCalendarTool())
+    registry.register(GoogleGmailTool())
 
     ltm_client = CortexLTMClient(
         base_url=settings.cortexltm_api_base_url,
@@ -149,12 +153,57 @@ def google_integration_status(
         raise HTTPException(status_code=503, detail=str(exc))
 
     try:
-        connected = connected_accounts_repo.has_active_account(
+        accounts = connected_accounts_repo.get_active_accounts(
             user_id=user_id, provider="google"
         )
-        return GoogleConnectionStatusResponse(connected=connected)
+        scope_values: set[str] = set()
+        for account in accounts:
+            raw_scope = (account.scope or "").strip()
+            if not raw_scope:
+                raw_scope = _backfill_google_scope_for_account(account)
+            if not raw_scope:
+                continue
+            for value in re.split(r"[\s,]+", raw_scope):
+                value = value.strip()
+                if value:
+                    scope_values.add(value)
+        return GoogleConnectionStatusResponse(
+            connected=bool(accounts),
+            scopes=sorted(scope_values),
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+def _backfill_google_scope_for_account(account) -> str:
+    access_token = (account.access_token or "").strip()
+    if not access_token:
+        return ""
+    try:
+        inferred_scope = (google_oauth.fetch_token_scope(access_token) or "").strip()
+    except Exception:
+        return ""
+    if not inferred_scope:
+        return ""
+    merged_scope = inferred_scope
+    try:
+        connected_accounts_repo.upsert_active_account(
+            ConnectedAccountUpsert(
+                user_id=account.user_id,
+                provider=account.provider,
+                provider_account_id=account.provider_account_id,
+                access_token=account.access_token,
+                refresh_token=account.refresh_token,
+                token_type=account.token_type,
+                scope=merged_scope,
+                expires_at=account.expires_at,
+                status=account.status or "active",
+                meta=account.meta,
+            )
+        )
+    except Exception:
+        return merged_scope
+    return merged_scope
 
 
 @app.post("/v1/agent/integrations/google/disconnect")

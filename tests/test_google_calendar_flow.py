@@ -138,6 +138,60 @@ class _CapturingConfirmingGoogleCalendarTool(Tool):
         )
 
 
+class _FakeEditableCalendarTool(Tool):
+    name = "google_calendar"
+
+    def run(self, context: ToolContext) -> ToolResult:
+        text = context.user_text.strip().lower()
+        if text.startswith("confirm:"):
+            return ToolResult(
+                tool_name=self.name,
+                query=context.user_text,
+                items=[
+                    ToolResultItem(
+                        title="[Created] Meeting with Jim",
+                        url="https://calendar.google.com/calendar/event?eid=created-jim-1",
+                        snippet="Created event | Starts: Sat, Feb 14 at 06:00 PM",
+                    )
+                ],
+            )
+        if "add event" in text or "add my meeting" in text or "add meeting" in text:
+            day = (
+                "Saturday, Feb 14, 2026"
+                if "today" in text or "saturday" in text
+                else "Sunday, Feb 15, 2026"
+            )
+            return ToolResult(
+                tool_name=self.name,
+                query=context.user_text,
+                items=[
+                    ToolResultItem(
+                        title="Confirmation required",
+                        url="https://calendar.google.com/",
+                        snippet=(
+                            "I have this draft event:\n"
+                            "- Title: Meeting with Jim\n"
+                            f"- Day: {day}\n"
+                            "- Time: 6:00 PM\n"
+                            "Should I add this to Google Calendar? "
+                            "Reply with 'confirm' to proceed or 'cancel' to stop."
+                        ),
+                    )
+                ],
+            )
+        return ToolResult(
+            tool_name=self.name,
+            query=context.user_text,
+            items=[
+                ToolResultItem(
+                    title="Team Sync",
+                    url="https://calendar.google.com/",
+                    snippet="Starts: Wed, Feb 18 at 11:00 AM",
+                )
+            ],
+        )
+
+
 class _FakeRepo:
     def __init__(self, resolved: ResolvedProviderToken | None) -> None:
         self._resolved = resolved
@@ -388,6 +442,218 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         self.assertIn("Google Calendar updated", second.response)
         self.assertIn("Link: https://calendar.google.com/calendar/event?eid=test-created-1", second.response)
 
+    def test_orchestrator_accepts_plain_confirm_for_calendar_draft(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        registry = ToolRegistry()
+        registry.register(_FakeConfirmingGoogleCalendarTool())
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="add my meeting with jerry on wednesday at 11am in san francisco",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="confirm",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Should I add this to Google Calendar?", first.response)
+        self.assertIn("Google Calendar updated", second.response)
+        self.assertIn(
+            "Link: https://calendar.google.com/calendar/event?eid=test-created-1",
+            second.response,
+        )
+
+    def test_orchestrator_accepts_confirm_with_trailing_period_for_calendar_draft(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        registry = ToolRegistry()
+        registry.register(_FakeConfirmingGoogleCalendarTool())
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="add my meeting with jerry on wednesday at 11am in san francisco",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="confirm.",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Should I add this to Google Calendar?", first.response)
+        self.assertIn("Google Calendar updated", second.response)
+        self.assertIn(
+            "Link: https://calendar.google.com/calendar/event?eid=test-created-1",
+            second.response,
+        )
+
+    def test_orchestrator_accepts_sure_for_calendar_draft(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        registry = ToolRegistry()
+        registry.register(_FakeConfirmingGoogleCalendarTool())
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="add my meeting with jerry on wednesday at 11am in san francisco",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="sure",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Should I add this to Google Calendar?", first.response)
+        self.assertIn("Google Calendar updated", second.response)
+        self.assertIn(
+            "Link: https://calendar.google.com/calendar/event?eid=test-created-1",
+            second.response,
+        )
+
+    def test_orchestrator_accepts_yea_for_calendar_draft(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        registry = ToolRegistry()
+        registry.register(_FakeConfirmingGoogleCalendarTool())
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="add my meeting with jerry on wednesday at 11am in san francisco",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="yea",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Should I add this to Google Calendar?", first.response)
+        self.assertIn("Google Calendar updated", second.response)
+        self.assertIn(
+            "Link: https://calendar.google.com/calendar/event?eid=test-created-1",
+            second.response,
+        )
+
     def test_orchestrator_treats_add_it_followup_as_confirmation(self):
         account = _active_account()
         resolved = ResolvedProviderToken(
@@ -449,7 +715,7 @@ class GoogleCalendarFlowTests(unittest.TestCase):
             "Reply with 'confirm' to proceed or 'cancel' to stop."
         )
         merged = _build_confirmed_calendar_request(draft_text=draft, followup_text="confirm")
-        self.assertTrue(merged.lower().startswith("confirm: "))
+        self.assertTrue(merged.lower().startswith("confirm: add event "))
         self.assertIn("Meeting with John From Coinbase", merged)
         self.assertIn("on Wednesday, Feb 18, 2026", merged)
         self.assertIn("at 11:00AM", merged)
@@ -472,6 +738,66 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         )
         self.assertNotIn("I've added your meeting to your calendar", result.response)
         self.assertIn("I haven’t added anything to your Google Calendar yet.", result.response)
+
+    def test_orchestrator_handles_calendar_day_correction_before_ok(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        registry = ToolRegistry()
+        registry.register(_FakeEditableCalendarTool())
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="add meeting with Jim tonight at 6pm to my calendar",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="today is saturday tho not sunday",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            third = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="ok",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Sunday, Feb 15, 2026", first.response)
+        self.assertIn("Saturday, Feb 14, 2026", second.response)
+        self.assertIn("Google Calendar updated", third.response)
+        self.assertIn(
+            "Link: https://calendar.google.com/calendar/event?eid=created-jim-1",
+            third.response,
+        )
 
 
 if __name__ == "__main__":

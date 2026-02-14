@@ -36,3 +36,4 @@ class GoogleConnectResponse(BaseModel):
 class GoogleConnectionStatusResponse(BaseModel):
     provider: str = "google"
     connected: bool
+    scopes: list[str] = Field(default_factory=list)
