@@ -1,6 +1,7 @@
 import html
 import json
 import re
+import base64
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -399,10 +400,17 @@ def _normalize_http_url(raw_url: str) -> str:
     cleaned = (raw_url or "").strip()
     if not cleaned:
         return ""
+    cleaned = _unwrap_tracking_url(cleaned)
     parsed = urlparse.urlparse(cleaned)
     if parsed.scheme.lower() not in {"http", "https"}:
         return ""
     if not parsed.netloc:
+        return ""
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if ("duckduckgo.com" in host and path == "/y.js") or (
+        "bing.com" in host and path == "/aclick"
+    ):
         return ""
     return cleaned
 
@@ -438,6 +446,62 @@ def _extract_bing_redirect_target(raw_href: str) -> str | None:
         decoded = decoded[2:]
     normalized = _normalize_http_url(decoded)
     return normalized or None
+
+
+def _unwrap_tracking_url(raw_url: str) -> str:
+    parsed = urlparse.urlparse(raw_url)
+    host = parsed.netloc.lower()
+    query = urlparse.parse_qs(parsed.query)
+
+    # DuckDuckGo wrappers may include direct target in uddg or nested targets in u/u3/url.
+    if "duckduckgo.com" in host:
+        for key in ("uddg", "u3", "u", "url"):
+            target = query.get(key, [None])[0]
+            if not target:
+                continue
+            decoded = _decode_tracking_target(target)
+            if decoded:
+                return decoded
+        return raw_url
+
+    # Bing ad-click wrappers often carry base64/encoded target in "u" or "url".
+    if "bing.com" in host and parsed.path.lower() == "/aclick":
+        for key in ("u", "url"):
+            target = query.get(key, [None])[0]
+            if not target:
+                continue
+            decoded = _decode_tracking_target(target)
+            if decoded:
+                return decoded
+        return raw_url
+
+    return raw_url
+
+
+def _decode_tracking_target(value: str) -> str | None:
+    candidate = urlparse.unquote((value or "").strip())
+    if not candidate:
+        return None
+    if candidate.startswith("a1http"):
+        candidate = candidate[2:]
+    if candidate.lower().startswith(("http://", "https://")):
+        return candidate
+
+    compact = candidate.strip()
+    pad = "=" * ((4 - (len(compact) % 4)) % 4)
+    attempts = [compact + pad]
+    attempts.append(compact.replace("-", "+").replace("_", "/") + pad)
+    for payload in attempts:
+        try:
+            decoded = base64.b64decode(payload).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        decoded = urlparse.unquote(decoded)
+        if decoded.startswith("a1http"):
+            decoded = decoded[2:]
+        if decoded.lower().startswith(("http://", "https://")):
+            return decoded
+    return None
 
 
 def _build_provider_chain(
