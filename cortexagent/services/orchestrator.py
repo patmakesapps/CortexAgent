@@ -7,8 +7,12 @@ from urllib import request as urlrequest
 
 from cortexagent.config import settings
 from cortexagent.models import AgentDecision
-from cortexagent.router import decide_action
+from cortexagent.router import RouteDecision, decide_action
 from cortexagent.services.cortexltm_client import CortexLTMClient
+from cortexagent.services.verification import (
+    assess_verification_profile,
+    enforce_verification_policy,
+)
 from cortexagent.tools import ToolContext, ToolRegistry
 
 
@@ -33,11 +37,23 @@ class AgentOrchestrator:
         short_term_limit: int | None,
         authorization: str | None,
     ) -> OrchestratorResult:
+        verification = assess_verification_profile(text)
         route = decide_action(
             user_text=text,
             tools_enabled=settings.agent_tools_enabled,
             web_search_enabled=settings.web_search_enabled,
         )
+        if (
+            verification.requires_web_verification
+            and settings.agent_tools_enabled
+            and settings.web_search_enabled
+            and route.action != "web_search"
+        ):
+            route = RouteDecision(
+                action="web_search",
+                reason=f"verification_override:{','.join(verification.reasons)}",
+                confidence=max(route.confidence, 0.9),
+            )
 
         if route.action != "web_search":
             assistant_text = self.ltm_client.chat(
@@ -45,6 +61,12 @@ class AgentOrchestrator:
                 text=text,
                 short_term_limit=short_term_limit,
                 authorization=authorization,
+            )
+            assistant_text = enforce_verification_policy(
+                user_text=text,
+                assistant_text=assistant_text,
+                sources=[],
+                profile=verification,
             )
             return OrchestratorResult(
                 response=assistant_text,
@@ -79,6 +101,12 @@ class AgentOrchestrator:
             user_text=text,
             assistant_text=assistant_text,
             sources=sources,
+        )
+        assistant_text = enforce_verification_policy(
+            user_text=text,
+            assistant_text=assistant_text,
+            sources=sources,
+            profile=verification,
         )
         self._persist_web_search_events(
             thread_id=thread_id,
