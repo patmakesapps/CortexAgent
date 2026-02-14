@@ -55,10 +55,15 @@ Optional:
 - `CORTEXLTM_API_KEY` (forwarded as `x-api-key`)
 - `AGENT_TOOLS_ENABLED` (`true`/`false`, default `true`)
 - `WEB_SEARCH_ENABLED` (`true`/`false`, default `true`)
-- `WEB_SEARCH_PROVIDER` (`brave` or `duckduckgo`, default `duckduckgo`)
+- `WEB_SEARCH_PROVIDER` (comma-separated fallback chain; e.g. `duckduckgo,bing,brave`; default `duckduckgo,bing`)
 - `BRAVE_SEARCH_API_KEY` (required for Brave provider)
 - `WEB_SEARCH_TIMEOUT_SECONDS` (default `8`)
 - `WEB_SEARCH_MAX_RESULTS` (default `5`)
+- `WEB_SEARCH_RETRIES` (per-provider retry count, default `2`)
+- `AGENT_ROUTER_LLM_ENABLED` (`true`/`false`, default `true`)
+- `AGENT_ROUTER_LLM_MODEL` (default: `AGENT_ROUTER_LLM_MODEL` -> `GROQ_ROUTER_MODEL` -> `GROQ_CHAT_MODEL` -> `llama-3.1-8b-instant`)
+- `AGENT_ROUTER_LLM_TIMEOUT_SECONDS` (default `6`)
+- `GROQ_API_KEY` (enables model-based route decisions; without it router falls back to heuristics)
 
 ## Route
 
@@ -69,4 +74,4 @@ Optional:
 ## Notes
 
 - The tool system is intentionally modular for future connectors (Notion, Slack, Calendar, etc.).
-- v1 intent routing is heuristic to avoid extra per-turn LLM cost.
+- Routing is model-first (system-prompt classifier) with heuristic fallback.
