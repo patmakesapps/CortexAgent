@@ -6,6 +6,7 @@ from dataclasses import dataclass
 class ToolContext:
     thread_id: str
     user_text: str
+    tool_meta: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)

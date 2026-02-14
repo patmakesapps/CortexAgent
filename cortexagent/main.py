@@ -6,6 +6,7 @@ from cortexagent.models import (
     AgentChatResponse,
     GoogleConnectRequest,
     GoogleConnectResponse,
+    GoogleConnectionStatusResponse,
 )
 from cortexagent.services import (
     AgentOrchestrator,
@@ -14,7 +15,7 @@ from cortexagent.services import (
     GoogleOAuthService,
     resolve_user_id_from_authorization,
 )
-from cortexagent.tools import ToolRegistry, WebSearchTool
+from cortexagent.tools import GoogleCalendarTool, ToolRegistry, WebSearchTool
 
 app = FastAPI(title="CortexAgent", version="0.1.0")
 
@@ -23,15 +24,20 @@ def _build_orchestrator() -> AgentOrchestrator:
     registry = ToolRegistry()
     if settings.web_search_enabled:
         registry.register(WebSearchTool())
+    registry.register(GoogleCalendarTool())
 
     ltm_client = CortexLTMClient(
         base_url=settings.cortexltm_api_base_url,
         api_key=settings.cortexltm_api_key,
     )
-    return AgentOrchestrator(ltm_client=ltm_client, tool_registry=registry)
+    return AgentOrchestrator(
+        ltm_client=ltm_client,
+        tool_registry=registry,
+        connected_accounts_repo=connected_accounts_repo,
+        google_oauth=google_oauth,
+    )
 
 
-orchestrator = _build_orchestrator()
 connected_accounts_repo = ConnectedAccountsRepository(
     supabase_url=settings.supabase_url,
     supabase_service_role_key=settings.supabase_service_role_key,
@@ -44,6 +50,7 @@ google_oauth = GoogleOAuthService(
     redirect_uri=settings.google_redirect_uri,
     timeout_seconds=settings.google_oauth_timeout_seconds,
 )
+orchestrator = _build_orchestrator()
 
 
 @app.get("/health")
@@ -120,3 +127,56 @@ def connect_google_integration(
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected google connect error: {exc}")
+
+
+@app.get(
+    "/v1/agent/integrations/google/status",
+    response_model=GoogleConnectionStatusResponse,
+)
+def google_integration_status(
+    authorization: str | None = Header(default=None),
+) -> GoogleConnectionStatusResponse:
+    try:
+        user_id = resolve_user_id_from_authorization(
+            authorization=authorization,
+            supabase_url=settings.supabase_url,
+            supabase_anon_key=settings.supabase_anon_key,
+            timeout_seconds=5,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    try:
+        connected = connected_accounts_repo.has_active_account(
+            user_id=user_id, provider="google"
+        )
+        return GoogleConnectionStatusResponse(connected=connected)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/v1/agent/integrations/google/disconnect")
+def google_integration_disconnect(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    try:
+        user_id = resolve_user_id_from_authorization(
+            authorization=authorization,
+            supabase_url=settings.supabase_url,
+            supabase_anon_key=settings.supabase_anon_key,
+            timeout_seconds=5,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    try:
+        disconnected = connected_accounts_repo.disconnect_provider(
+            user_id=user_id, provider="google"
+        )
+        return {"provider": "google", "disconnected": disconnected}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))

@@ -4,6 +4,8 @@ from typing import Any
 
 import requests
 
+from .token_security import redact_sensitive_text
+
 
 def extract_bearer_token(authorization: str | None) -> str | None:
     if not authorization:
@@ -42,7 +44,8 @@ def fetch_supabase_user_id(
         raise ValueError("Invalid or expired access token.")
     if not response.ok:
         raise RuntimeError(
-            f"Auth provider unavailable: HTTP {response.status_code} {response.text.strip()}"
+            "Auth provider unavailable: "
+            f"HTTP {response.status_code} {redact_sensitive_text(response.text.strip())}"
         )
 
     payload = response.json()

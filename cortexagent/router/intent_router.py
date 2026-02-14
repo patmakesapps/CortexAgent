@@ -49,6 +49,17 @@ NON_WEB_TASK_TERMS = (
     "draft",
 )
 
+GOOGLE_CALENDAR_TERMS = (
+    "calendar",
+    "google calendar",
+    "upcoming events",
+    "my schedule",
+    "my events",
+    "next meeting",
+    "today on my calendar",
+    "tomorrow on my calendar",
+)
+
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -59,6 +70,12 @@ class RouteDecision:
 
 def _keyword_decision(user_text: str) -> RouteDecision:
     text = user_text.strip().lower()
+    if any(term in text for term in GOOGLE_CALENDAR_TERMS):
+        return RouteDecision(
+            action="google_calendar",
+            reason="matched_google_calendar_intent",
+            confidence=0.93,
+        )
     if any(term in text for term in EXPLICIT_WEB_INTENT_TERMS):
         return RouteDecision(
             action="web_search",
@@ -105,15 +122,17 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
         "You are a routing classifier for a chat agent.\n"
         "Choose one action for the user request:\n"
         "- web_search: requires current/external/verifiable web data\n"
+        "- google_calendar: user asks about their own schedule/events/calendar\n"
         "- chat: answer directly from internal reasoning/knowledge\n\n"
         "Rules:\n"
         "- Prefer web_search for time-sensitive facts (news, prices, weather, sports, schedules, releases, laws, policies, outages, version changes).\n"
         "- Prefer web_search when stale information could cause a wrong answer.\n"
         "- Prefer chat for timeless concepts, creative writing, coding help, editing, translation, and personal advice.\n"
         "- Keywords are hints, not the source of truth.\n"
+        "- If user clearly refers to their personal calendar/events/schedule, prefer google_calendar.\n"
         "- Return strict JSON only.\n\n"
         "Output schema:\n"
-        '{"action":"web_search|chat","reason":"short_reason","confidence":0.0}'
+        '{"action":"web_search|google_calendar|chat","reason":"short_reason","confidence":0.0}'
     )
 
     payload = {
@@ -157,7 +176,7 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
     except Exception:
         return None
 
-    if action not in {"chat", "web_search"}:
+    if action not in {"chat", "web_search", "google_calendar"}:
         return None
     if confidence < 0.0:
         confidence = 0.0

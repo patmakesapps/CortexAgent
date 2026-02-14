@@ -31,3 +31,8 @@ class GoogleConnectResponse(BaseModel):
     status: str
     scopes: list[str] = Field(default_factory=list)
     expires_at: str | None = None
+
+
+class GoogleConnectionStatusResponse(BaseModel):
+    provider: str = "google"
+    connected: bool

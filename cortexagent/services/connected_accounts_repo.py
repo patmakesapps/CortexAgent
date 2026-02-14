@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+from .token_security import TokenCipher, build_token_cipher_from_env, redact_sensitive_text
+
 
 @dataclass(frozen=True)
 class ConnectedAccount:
@@ -57,11 +59,13 @@ class ConnectedAccountsRepository:
         supabase_service_role_key: str | None,
         table: str = "ltm_connected_accounts",
         timeout_seconds: int = 8,
+        token_cipher: TokenCipher | None = None,
     ) -> None:
         self.supabase_url = (supabase_url or "").rstrip("/")
         self.supabase_service_role_key = (supabase_service_role_key or "").strip()
         self.table = (table or "ltm_connected_accounts").strip()
         self.timeout_seconds = max(1, int(timeout_seconds))
+        self.token_cipher = token_cipher or build_token_cipher_from_env()
 
     def is_configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_service_role_key and self.table)
@@ -81,6 +85,16 @@ class ConnectedAccountsRepository:
         if not rows:
             return None
         return rows[0]
+
+    def has_active_account(self, user_id: str, provider: str) -> bool:
+        return self.get_active_account(user_id=user_id, provider=provider) is not None
+
+    def disconnect_provider(self, user_id: str, provider: str) -> bool:
+        account = self.get_active_account(user_id=user_id, provider=provider)
+        if account is None:
+            return False
+        self.soft_delete_account(account.id)
+        return True
 
     def upsert_active_account(self, payload: ConnectedAccountUpsert) -> ConnectedAccount:
         existing = self.get_active_account(
@@ -179,7 +193,11 @@ class ConnectedAccountsRepository:
         payload = response.json()
         if not isinstance(payload, list):
             raise RuntimeError("Unexpected connected account response payload.")
-        return [_to_connected_account(row) for row in payload if isinstance(row, dict)]
+        return [
+            _to_connected_account(row, token_cipher=self.token_cipher)
+            for row in payload
+            if isinstance(row, dict)
+        ]
 
     def _insert_account(self, payload: ConnectedAccountUpsert) -> ConnectedAccount:
         self._ensure_configured()
@@ -187,8 +205,8 @@ class ConnectedAccountsRepository:
             "user_id": payload.user_id,
             "provider": payload.provider.strip().lower(),
             "provider_account_id": payload.provider_account_id,
-            "access_token": payload.access_token,
-            "refresh_token": payload.refresh_token,
+            "access_token": self._encrypt_token(payload.access_token),
+            "refresh_token": self._encrypt_token(payload.refresh_token),
             "token_type": payload.token_type,
             "scope": payload.scope,
             "expires_at": _to_iso(payload.expires_at),
@@ -205,11 +223,16 @@ class ConnectedAccountsRepository:
         rows = response.json()
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             raise RuntimeError("Insert connected account returned no rows.")
-        return _to_connected_account(rows[0])
+        return _to_connected_account(rows[0], token_cipher=self.token_cipher)
 
     def _patch_account(self, account_id: str, patch: dict[str, Any]) -> ConnectedAccount:
         self._ensure_configured()
-        clean_patch = {key: value for key, value in patch.items()}
+        clean_patch = {
+            key: self._encrypt_token(value)
+            if key in {"access_token", "refresh_token"}
+            else value
+            for key, value in patch.items()
+        }
         response = requests.patch(
             self._table_url(),
             headers=self._headers(prefer="return=representation"),
@@ -221,7 +244,7 @@ class ConnectedAccountsRepository:
         rows = response.json()
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             raise RuntimeError("Update connected account returned no rows.")
-        return _to_connected_account(rows[0])
+        return _to_connected_account(rows[0], token_cipher=self.token_cipher)
 
     def _headers(self, prefer: str | None = None) -> dict[str, str]:
         headers = {
@@ -248,20 +271,26 @@ class ConnectedAccountsRepository:
     def _raise_for_error(response: requests.Response, action: str) -> None:
         if response.ok:
             return
-        detail = response.text.strip()
+        detail = redact_sensitive_text(response.text.strip())
         raise RuntimeError(
             f"Failed to {action}: HTTP {response.status_code} {detail or 'request failed'}"
         )
 
+    def _encrypt_token(self, value: str | None) -> str | None:
+        return self.token_cipher.encrypt(value)
 
-def _to_connected_account(row: dict[str, Any]) -> ConnectedAccount:
+
+def _to_connected_account(
+    row: dict[str, Any], token_cipher: TokenCipher | None = None
+) -> ConnectedAccount:
+    cipher = token_cipher or build_token_cipher_from_env()
     return ConnectedAccount(
         id=str(row.get("id", "")),
         user_id=str(row.get("user_id", "")),
         provider=str(row.get("provider", "")),
         provider_account_id=str(row.get("provider_account_id", "")),
-        access_token=_opt_str(row.get("access_token")),
-        refresh_token=_opt_str(row.get("refresh_token")),
+        access_token=cipher.decrypt(_opt_str(row.get("access_token"))),
+        refresh_token=cipher.decrypt(_opt_str(row.get("refresh_token"))),
         token_type=_opt_str(row.get("token_type")),
         scope=_opt_str(row.get("scope")),
         expires_at=_parse_time(row.get("expires_at")),

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import re
 import json
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -8,7 +8,13 @@ from urllib import request as urlrequest
 from cortexagent.config import settings
 from cortexagent.models import AgentDecision
 from cortexagent.router import RouteDecision, decide_action
+from cortexagent.services.connected_accounts_repo import (
+    ConnectedAccountsRepository,
+    ConnectedAccountUpsert,
+)
 from cortexagent.services.cortexltm_client import CortexLTMClient
+from cortexagent.services.google_oauth import GoogleOAuthService
+from cortexagent.services.supabase_auth import resolve_user_id_from_authorization
 from cortexagent.services.verification import (
     assess_verification_profile,
     enforce_verification_policy,
@@ -25,10 +31,16 @@ class OrchestratorResult:
 
 class AgentOrchestrator:
     def __init__(
-        self, ltm_client: CortexLTMClient, tool_registry: ToolRegistry
+        self,
+        ltm_client: CortexLTMClient,
+        tool_registry: ToolRegistry,
+        connected_accounts_repo: ConnectedAccountsRepository | None = None,
+        google_oauth: GoogleOAuthService | None = None,
     ) -> None:
         self.ltm_client = ltm_client
         self.tool_registry = tool_registry
+        self.connected_accounts_repo = connected_accounts_repo
+        self.google_oauth = google_oauth
 
     def handle_chat(
         self,
@@ -56,7 +68,7 @@ class AgentOrchestrator:
                 confidence=max(route.confidence, 0.9),
             )
 
-        if route.action != "web_search":
+        if route.action not in {"web_search", "google_calendar"}:
             assistant_text = self.ltm_client.chat(
                 thread_id=thread_id,
                 text=text,
@@ -77,6 +89,73 @@ class AgentOrchestrator:
                     confidence=route.confidence,
                 ),
                 sources=[],
+            )
+
+        if route.action == "google_calendar":
+            tool = self.tool_registry.get("google_calendar")
+            try:
+                access_token, token_meta = self._resolve_google_access_token(
+                    authorization=authorization
+                )
+            except Exception as exc:
+                assistant_text = str(exc)
+                return OrchestratorResult(
+                    response=assistant_text,
+                    decision=AgentDecision(
+                        action="google_calendar",
+                        reason="google_calendar_auth_failed",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+
+            try:
+                result = tool.run(
+                    ToolContext(
+                        thread_id=thread_id,
+                        user_text=text,
+                        tool_meta={
+                            "access_token": access_token,
+                            "max_results": 8,
+                        },
+                    )
+                )
+            except Exception as exc:
+                assistant_text = (
+                    "I routed this request to Google Calendar, but the request failed. "
+                    f"Error: {exc}"
+                )
+                return OrchestratorResult(
+                    response=assistant_text,
+                    decision=AgentDecision(
+                        action="google_calendar",
+                        reason="google_calendar_failed",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+
+            assistant_text, sources = _format_google_calendar_response(result.items)
+            self._persist_tool_events(
+                thread_id=thread_id,
+                user_text=text,
+                assistant_text=assistant_text,
+                tool_name=result.tool_name,
+                query=result.query,
+                sources=sources,
+                authorization=authorization,
+                decision_action=route.action,
+                capability_label="Google Calendar",
+                extra_meta=token_meta,
+            )
+            return OrchestratorResult(
+                response=assistant_text,
+                decision=AgentDecision(
+                    action=route.action,
+                    reason=route.reason,
+                    confidence=route.confidence,
+                ),
+                sources=sources,
             )
 
         tool = self.tool_registry.get("web_search")
@@ -109,7 +188,7 @@ class AgentOrchestrator:
             sources=sources,
             profile=verification,
         )
-        self._persist_web_search_events(
+        self._persist_tool_events(
             thread_id=thread_id,
             user_text=text,
             assistant_text=assistant_text,
@@ -117,6 +196,8 @@ class AgentOrchestrator:
             query=result.query,
             sources=sources,
             authorization=authorization,
+            decision_action=route.action,
+            capability_label="Web Search",
         )
 
         return OrchestratorResult(
@@ -129,7 +210,7 @@ class AgentOrchestrator:
             sources=sources,
         )
 
-    def _persist_web_search_events(
+    def _persist_tool_events(
         self,
         thread_id: str,
         user_text: str,
@@ -138,6 +219,9 @@ class AgentOrchestrator:
         query: str,
         sources: list[dict[str, str]],
         authorization: str | None,
+        decision_action: str,
+        capability_label: str,
+        extra_meta: dict[str, object] | None = None,
     ) -> None:
         # Best effort persistence: tool responses should still return even if writes fail.
         try:
@@ -145,27 +229,126 @@ class AgentOrchestrator:
                 thread_id=thread_id,
                 actor="user",
                 content=user_text,
-                meta={"source": "cortexagent", "decision": "web_search"},
+                meta={
+                    "source": "cortexagent",
+                    "decision": decision_action,
+                    "tool_usage": {
+                        "tool": tool_name,
+                        "query": query,
+                    },
+                },
                 authorization=authorization,
             )
         except Exception:
             pass
+
+        assistant_meta: dict[str, object] = {
+            "source": f"cortexagent_{decision_action}",
+            "tool": tool_name,
+            "query": query,
+            "source_urls": [s["url"] for s in sources],
+            "tool_usage": {
+                "tool": tool_name,
+                "query": query,
+                "source_count": len(sources),
+            },
+            "agent_trace": {
+                "version": 1,
+                "source": "cortex-agent",
+                "action": decision_action,
+                "capabilities": [
+                    {"id": decision_action, "type": "tool", "label": capability_label}
+                ],
+            },
+        }
+        if extra_meta:
+            assistant_meta["tool_usage"] = {
+                **(assistant_meta.get("tool_usage") or {}),
+                **extra_meta,
+            }
 
         try:
             self.ltm_client.add_event(
                 thread_id=thread_id,
                 actor="assistant",
                 content=assistant_text,
-                meta={
-                    "source": "cortexagent_web_search",
-                    "tool": tool_name,
-                    "query": query,
-                    "source_urls": [s["url"] for s in sources],
-                },
+                meta=assistant_meta,
                 authorization=authorization,
             )
         except Exception:
             pass
+
+    def _resolve_google_access_token(
+        self, authorization: str | None
+    ) -> tuple[str, dict[str, object]]:
+        if not self.connected_accounts_repo or not self.google_oauth:
+            raise RuntimeError("Google Calendar is currently unavailable.")
+        if not authorization:
+            raise RuntimeError("Please sign in, then reconnect Google Calendar.")
+
+        user_id = resolve_user_id_from_authorization(
+            authorization=authorization,
+            supabase_url=settings.supabase_url,
+            supabase_anon_key=settings.supabase_anon_key,
+            timeout_seconds=5,
+        )
+        resolved = self.connected_accounts_repo.resolve_provider_token(
+            user_id=user_id, provider="google"
+        )
+        if resolved is None:
+            raise RuntimeError(
+                "Google Calendar is not connected. Use Connect Google in Settings first."
+            )
+        if resolved.access_token and not resolved.is_access_token_expired:
+            return (
+                resolved.access_token,
+                {
+                    "token_refreshed": False,
+                    "token_expires_at": resolved.expires_at.isoformat()
+                    if resolved.expires_at
+                    else None,
+                },
+            )
+
+        if not resolved.refresh_token:
+            raise RuntimeError(
+                "Google connection expired and cannot refresh automatically. "
+                "Please reconnect Google Calendar."
+            )
+        try:
+            refreshed = self.google_oauth.refresh_access_token(resolved.refresh_token)
+        except Exception as exc:
+            raise RuntimeError(
+                "Google authorization expired and refresh failed. "
+                "Please reconnect Google Calendar."
+            ) from exc
+
+        next_refresh = refreshed.refresh_token or resolved.refresh_token
+        expires_at = None
+        if isinstance(refreshed.expires_in, int) and refreshed.expires_in > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=refreshed.expires_in)
+
+        self.connected_accounts_repo.upsert_active_account(
+            payload=ConnectedAccountUpsert(
+                user_id=resolved.account.user_id,
+                provider=resolved.account.provider,
+                provider_account_id=resolved.account.provider_account_id,
+                access_token=refreshed.access_token,
+                refresh_token=next_refresh,
+                token_type=refreshed.token_type or resolved.account.token_type,
+                scope=refreshed.scope or resolved.account.scope,
+                expires_at=expires_at,
+                status="active",
+                meta=resolved.account.meta,
+            )
+        )
+        return (
+            refreshed.access_token,
+            {
+                "token_refreshed": True,
+                "token_expires_at": expires_at.isoformat() if expires_at else None,
+            },
+        )
 
 
 def _format_web_search_response(
@@ -224,6 +407,64 @@ def _format_web_search_response(
         lines.append(f"- {src['title']}: {src['url']}")
 
     return "\n".join(lines), sources
+
+
+def _format_google_calendar_response(
+    items: list,
+) -> tuple[str, list[dict[str, str]]]:
+    if not items:
+        return (
+            "I could not find upcoming events in your Google Calendar.",
+            [],
+        )
+    lines = ["Upcoming Google Calendar events:"]
+    sources: list[dict[str, str]] = []
+    for idx, item in enumerate(items[:8], start=1):
+        pretty_snippet = _normalize_calendar_snippet(item.snippet)
+        lines.append(f"{idx}. {item.title} - {pretty_snippet}")
+        sources.append(
+            {
+                "title": item.title,
+                "url": "https://calendar.google.com/",
+                "snippet": pretty_snippet,
+            }
+        )
+    lines.append("Sources:")
+    lines.append("- Google Calendar: https://calendar.google.com/")
+    return ("\n".join(lines), sources)
+
+
+def _normalize_calendar_snippet(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return "Time unavailable"
+    parts = [part.strip() for part in text.split("|")]
+    time_text = parts[0] if parts else text
+    location = parts[1] if len(parts) > 1 else ""
+    pretty_time = _humanize_calendar_time_label(time_text)
+    if location:
+        return f"{pretty_time} | {location}"
+    return pretty_time
+
+
+def _humanize_calendar_time_label(label: str) -> str:
+    raw = label.strip()
+    if not raw.lower().startswith("starts:"):
+        return raw
+    value = raw[7:].strip()
+    if not value:
+        return "Starts: Time unavailable"
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return f"Starts: {value}"
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+        stamp = parsed.strftime("%a, %b %d at %I:%M %p").replace(" 0", " ")
+        return f"Starts: {stamp}"
+    stamp = parsed.strftime("%a, %b %d (all day)").replace(" 0", " ")
+    return f"Starts: {stamp}"
 
 
 PRICE_QUERY_TOKENS = {

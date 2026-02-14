@@ -12,6 +12,7 @@ from .connected_accounts_repo import (
     ConnectedAccountsRepository,
     ConnectedAccountUpsert,
 )
+from .token_security import redact_sensitive_text
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,11 @@ class GoogleOAuthService:
         token = self.exchange_code(code=code, code_verifier=code_verifier)
         user_info = self.fetch_user_info(token.access_token)
         provider_account_id = self._read_provider_account_id(user_info)
+        existing = repo.get_active_account(
+            user_id=user_id,
+            provider="google",
+            provider_account_id=provider_account_id,
+        )
 
         expires_at = None
         if isinstance(token.expires_in, int) and token.expires_in > 0:
@@ -68,7 +74,7 @@ class GoogleOAuthService:
                 provider="google",
                 provider_account_id=provider_account_id,
                 access_token=token.access_token,
-                refresh_token=token.refresh_token,
+                refresh_token=token.refresh_token or (existing.refresh_token if existing else None),
                 token_type=token.token_type,
                 scope=token.scope,
                 expires_at=expires_at,
@@ -82,6 +88,50 @@ class GoogleOAuthService:
             )
         )
         return account
+
+    def refresh_access_token(self, refresh_token: str) -> GoogleTokenExchange:
+        if not self.is_configured():
+            raise RuntimeError(
+                "Google OAuth is not configured. Set GOOGLE_CLIENT_ID, "
+                "GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI."
+            )
+        body = {
+            "refresh_token": refresh_token.strip(),
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "grant_type": "refresh_token",
+        }
+        response = requests.post(
+            self.TOKEN_URL,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=self.timeout_seconds,
+        )
+        if not response.ok:
+            detail = _extract_google_error(response)
+            raise RuntimeError(f"Google refresh failed: {detail}")
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Google refresh returned unexpected payload.")
+        access_token = payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise RuntimeError("Google refresh missing access_token.")
+
+        expires_in_raw = payload.get("expires_in")
+        expires_in: int | None = None
+        if isinstance(expires_in_raw, int):
+            expires_in = expires_in_raw
+        elif isinstance(expires_in_raw, str) and expires_in_raw.isdigit():
+            expires_in = int(expires_in_raw)
+
+        return GoogleTokenExchange(
+            access_token=access_token.strip(),
+            refresh_token=_opt_str(payload.get("refresh_token")),
+            token_type=_opt_str(payload.get("token_type")),
+            scope=_opt_str(payload.get("scope")),
+            expires_in=expires_in,
+        )
 
     def exchange_code(
         self, code: str, code_verifier: str | None = None
@@ -136,7 +186,8 @@ class GoogleOAuthService:
         )
         if not response.ok:
             raise RuntimeError(
-                f"Google userinfo fetch failed: HTTP {response.status_code} {response.text.strip()}"
+                "Google userinfo fetch failed: "
+                f"HTTP {response.status_code} {redact_sensitive_text(response.text.strip())}"
             )
         payload = response.json()
         if not isinstance(payload, dict):
@@ -158,7 +209,7 @@ def _opt_str(value: Any) -> str | None:
 
 
 def _extract_google_error(response: requests.Response) -> str:
-    text = response.text.strip()
+    text = redact_sensitive_text(response.text.strip())
     try:
         payload = response.json()
     except Exception:
