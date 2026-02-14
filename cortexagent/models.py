@@ -17,3 +17,17 @@ class AgentChatResponse(BaseModel):
     response: str
     decision: AgentDecision
     sources: list[dict[str, str]] = Field(default_factory=list)
+
+
+class GoogleConnectRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=4096)
+    code_verifier: str | None = Field(default=None, min_length=16, max_length=2048)
+
+
+class GoogleConnectResponse(BaseModel):
+    provider: str
+    provider_account_id: str
+    user_id: str
+    status: str
+    scopes: list[str] = Field(default_factory=list)
+    expires_at: str | None = None

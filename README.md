@@ -37,7 +37,21 @@ v1 goal:
 
 ## Setup
 
-1. Create venv and install dependencies:
+When using the top-level `Cortex.cmd` runner, CortexAgent and CortexLTM share the same
+Python interpreter at `CortexLTM/.venv/Scripts/python.exe`.
+
+1. Shared venv workflow (recommended with `Cortex.cmd`):
+
+```powershell
+cd ..\CortexLTM
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+cd ..\CortexAgent
+pip install -r requirements.txt
+```
+
+2. Optional standalone venv workflow (manual CortexAgent-only runs):
 
 ```powershell
 py -m venv .venv
@@ -45,13 +59,13 @@ py -m venv .venv
 pip install -r requirements.txt
 ```
 
-2. Configure env:
+3. Configure env:
 
 ```powershell
 copy .env.example .env
 ```
 
-3. Start server:
+4. Start server:
 
 ```powershell
 uvicorn cortexagent.main:app --host 0.0.0.0 --port 8010
@@ -75,12 +89,23 @@ Optional:
 - `AGENT_ROUTER_LLM_MODEL` (default: `AGENT_ROUTER_LLM_MODEL` -> `GROQ_ROUTER_MODEL` -> `GROQ_CHAT_MODEL` -> `llama-3.1-8b-instant`)
 - `AGENT_ROUTER_LLM_TIMEOUT_SECONDS` (default `6`)
 - `GROQ_API_KEY` (enables model-based route decisions; without it router falls back to heuristics)
+- `SUPABASE_URL` (required for integration connect routes that validate bearer auth)
+- `SUPABASE_ANON_KEY` (required for integration connect routes that validate bearer auth)
+- `SUPABASE_SERVICE_ROLE_KEY` (required for connected-account writes via Supabase PostgREST)
+- `CONNECTED_ACCOUNTS_TABLE` (default `ltm_connected_accounts`)
+- `CONNECTED_ACCOUNTS_TIMEOUT_SECONDS` (default `8`)
+- `GOOGLE_CLIENT_ID` (required for Google OAuth code exchange)
+- `GOOGLE_CLIENT_SECRET` (required for Google OAuth code exchange)
+- `GOOGLE_REDIRECT_URI` (must exactly match Google OAuth client redirect URI)
+- `GOOGLE_OAUTH_TIMEOUT_SECONDS` (default `8`)
 
 ## Route
 
 - `POST /v1/agent/threads/{thread_id}/chat`
   - If tool intent is detected and enabled, runs web search and returns a cited answer.
   - Otherwise forwards to CortexLTM `/v1/threads/{thread_id}/chat`.
+- `POST /v1/agent/integrations/google/connect`
+  - Exchanges Google OAuth `code` for tokens, validates caller via bearer token, and upserts a row in `ltm_connected_accounts`.
 
 ## Notes
 
