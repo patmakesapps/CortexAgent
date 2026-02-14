@@ -317,6 +317,57 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         self.assertEqual(result.decision.action, "google_calendar")
         self.assertEqual(len(repo.upserts), 1)
 
+    def test_orchestrator_routes_short_followup_to_recent_calendar_tool(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=None,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=True,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="new-access",
+                refresh_token="new-refresh",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        registry = ToolRegistry()
+        registry.register(_FakeGoogleCalendarTool())
+
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="show my upcoming calendar events",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="okay now check",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertEqual(first.decision.action, "google_calendar")
+        self.assertEqual(second.decision.action, "google_calendar")
+        self.assertEqual(second.decision.reason, "calendar_context_followup")
+
     def test_orchestrator_returns_reauth_message_when_refresh_fails(self):
         account = _active_account()
         resolved = ResolvedProviderToken(

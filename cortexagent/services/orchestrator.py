@@ -43,6 +43,7 @@ class AgentOrchestrator:
         self.google_oauth = google_oauth
         self._pending_calendar_drafts: dict[str, str] = {}
         self._pending_gmail_send_requests: dict[str, str] = {}
+        self._last_tool_action_by_thread: dict[str, str] = {}
 
     def handle_chat(
         self,
@@ -77,7 +78,11 @@ class AgentOrchestrator:
                 ),
                 sources=[],
             )
-        if not pending_calendar_draft and _is_standalone_calendar_confirmation_reply(text):
+        if (
+            not pending_calendar_draft
+            and not pending_gmail_send
+            and _is_standalone_calendar_confirmation_reply(text)
+        ):
             response = (
                 "I don't have a pending calendar draft to confirm right now. "
                 "Tell me the event details, and I'll draft it for your approval."
@@ -113,6 +118,13 @@ class AgentOrchestrator:
                 tools_enabled=settings.agent_tools_enabled,
                 web_search_enabled=settings.web_search_enabled,
             )
+            if route.action == "chat":
+                sticky_route = _maybe_continue_recent_tool_route(
+                    text=text,
+                    previous_action=self._last_tool_action_by_thread.get(thread_id),
+                )
+                if sticky_route is not None:
+                    route = sticky_route
         if (
             verification.requires_web_verification
             and settings.agent_tools_enabled
@@ -125,6 +137,8 @@ class AgentOrchestrator:
                 reason=f"verification_override:{','.join(verification.reasons)}",
                 confidence=max(route.confidence, 0.9),
             )
+        if route.action in {"google_calendar", "google_gmail"}:
+            self._last_tool_action_by_thread[thread_id] = route.action
 
         if route.action not in {"web_search", "google_calendar", "google_gmail"}:
             assistant_text = self.ltm_client.chat(
@@ -724,10 +738,12 @@ def _format_google_calendar_response(
         if title.startswith("[Created] "):
             title = title.replace("[Created] ", "", 1) + " (created)"
         pretty_snippet = _normalize_calendar_snippet(item.snippet)
-        line = f"{idx}. {title} - {pretty_snippet}"
-        if "(created)" in title:
-            line += f" | Link: {item_url}"
-        lines.append(line)
+        starts_text, location_text = _split_calendar_snippet_fields(pretty_snippet)
+        lines.append(f"{idx}. {title}")
+        lines.append(f"   {starts_text}")
+        if location_text:
+            lines.append(f"   Location: {location_text}")
+        lines.append(f"   Link: {item_url}")
         sources.append(
             {
                 "title": title,
@@ -735,8 +751,6 @@ def _format_google_calendar_response(
                 "snippet": pretty_snippet,
             }
         )
-    lines.append("Sources:")
-    lines.append("- Google Calendar: https://calendar.google.com/")
     return ("\n".join(lines), sources)
 
 
@@ -777,30 +791,119 @@ def _format_google_gmail_response(
     elif has_draft:
         lines = ["Gmail draft created:"]
     else:
-        lines = ["Gmail results:"]
+        lines = ["Primary inbox emails:"]
 
     sources: list[dict[str, str]] = []
     for idx, item in enumerate(items[:8], start=1):
-        lines.append(f"{idx}. {item.title} - {item.snippet}")
+        raw_title = str(getattr(item, "title", "")).strip()
+        pretty_title = _normalize_gmail_result_title(raw_title)
+        item_url = str(getattr(item, "url", "")).strip() or "https://mail.google.com/"
+        snippet = str(getattr(item, "snippet", "")).strip()
+        lines.append(f"{idx}. {pretty_title}")
+        for detail in _format_gmail_item_details(snippet):
+            lines.append(f"   {detail}")
+        lines.append(f"   Link: {item_url}")
+        lines.append("")
         sources.append(
             {
-                "title": str(getattr(item, "title", "")).strip() or "Gmail result",
-                "url": str(getattr(item, "url", "")).strip() or "https://mail.google.com/",
-                "snippet": str(getattr(item, "snippet", "")).strip(),
+                "title": raw_title or "Gmail result",
+                "url": item_url,
+                "snippet": snippet,
             }
         )
-    lines.append("Sources:")
-    lines.append("- Gmail: https://mail.google.com/")
+    if lines and not lines[-1].strip():
+        lines.pop()
     return ("\n".join(lines), sources)
+
+
+def _split_calendar_snippet_fields(snippet: str) -> tuple[str, str]:
+    parts = [part.strip() for part in (snippet or "").split("|", 1)]
+    starts_text = parts[0] if parts and parts[0] else "Starts: Time unavailable"
+    location_text = parts[1] if len(parts) > 1 else ""
+    return starts_text, location_text
+
+
+def _normalize_gmail_result_title(raw_title: str) -> str:
+    title = (raw_title or "").strip()
+    if not title:
+        return "Gmail result"
+    thread_match = re.match(r"^Thread\s+([a-z0-9_-]+)\s*\|\s*(.+)$", title, re.IGNORECASE)
+    if thread_match:
+        subject = thread_match.group(2).strip()
+        return subject
+    read_match = re.match(
+        r"^Message from thread\s+([a-z0-9_-]+)\s*\|\s*(.+)$",
+        title,
+        re.IGNORECASE,
+    )
+    if read_match:
+        subject = read_match.group(2).strip()
+        return subject
+    drafted_match = re.match(r"^\[Drafted\]\s+Thread\s+([a-z0-9_-]+)$", title, re.IGNORECASE)
+    if drafted_match:
+        return "Drafted reply"
+    return title
+
+
+def _format_gmail_item_details(snippet: str) -> list[str]:
+    expanded = _expand_tool_item_details(snippet)
+    if not expanded:
+        return []
+    first = expanded[0]
+    if first.lower().startswith("from:"):
+        sender = first[5:].strip() or "Unknown sender"
+        preview = ""
+        for row in expanded[1:]:
+            lowered = row.lower()
+            if lowered.startswith("[security]"):
+                continue
+            preview = row
+            break
+        out = [f"From: {sender}"]
+        if preview:
+            out.append(f"Preview: {preview}")
+        return out
+    return expanded
+
+
+def _expand_tool_item_details(snippet: str) -> list[str]:
+    if not snippet:
+        return []
+    out: list[str] = []
+    for row in snippet.splitlines():
+        line = row.strip()
+        if not line:
+            continue
+        if "|" in line:
+            for part in line.split("|"):
+                cleaned = part.strip()
+                if cleaned:
+                    out.append(cleaned)
+            continue
+        out.append(line)
+    return out
 
 
 def _normalize_calendar_snippet(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
         return "Time unavailable"
-    parts = [part.strip() for part in text.split("|")]
-    time_text = parts[0] if parts else text
-    location = parts[1] if len(parts) > 1 else ""
+    parts = [part.strip() for part in text.split("|") if part.strip()]
+    time_text = ""
+    location_parts: list[str] = []
+    for part in parts:
+        lowered = part.lower()
+        if lowered.startswith("starts:") and not time_text:
+            time_text = part
+            continue
+        if lowered.startswith("created event"):
+            continue
+        location_parts.append(part)
+    if not time_text:
+        time_text = parts[0] if parts else text
+        if parts:
+            location_parts = parts[1:]
+    location = " | ".join(location_parts).strip()
     pretty_time = _humanize_calendar_time_label(time_text)
     if location:
         return f"{pretty_time} | {location}"
@@ -1204,6 +1307,71 @@ def _should_force_verification_web_search(user_text: str, reasons: list[str]) ->
     )
 
 
+def _maybe_continue_recent_tool_route(
+    text: str,
+    previous_action: str | None,
+) -> RouteDecision | None:
+    if previous_action not in {"google_calendar", "google_gmail"}:
+        return None
+    lowered = text.strip().lower()
+    if not _looks_like_contextual_tool_followup(text):
+        return None
+    if previous_action == "google_calendar" and re.search(
+        r"\b(gmail|email|inbox|thread|draft)\b", lowered
+    ):
+        return None
+    if previous_action == "google_gmail" and re.search(
+        r"\b(calendar|schedule|event|meeting)\b", lowered
+    ):
+        return None
+    reason = (
+        "calendar_context_followup"
+        if previous_action == "google_calendar"
+        else "gmail_context_followup"
+    )
+    return RouteDecision(action=previous_action, reason=reason, confidence=0.9)
+
+
+def _looks_like_contextual_tool_followup(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered or len(lowered) > 90:
+        return False
+    normalized = _normalize_short_reply_text(text)
+    if normalized in {
+        "check",
+        "check now",
+        "now check",
+        "again",
+        "what about",
+        "what about today",
+        "what about tomorrow",
+        "what about this week",
+        "what about this month",
+        "show me",
+        "refresh",
+        "now",
+    }:
+        return True
+    if re.search(r"\b(this|next)\s+(week|month)\b", lowered):
+        return True
+    if re.search(r"\b(today|tomorrow|yesterday)\b", lowered):
+        return True
+    if re.search(r"\bon\s+\d{1,2}(?:st|nd|rd|th)?\b", lowered):
+        return True
+    if re.search(r"\bon\s+\w+day\b", lowered):
+        return True
+    if re.match(
+        r"^\s*(ok|okay|alright|cool|great|thanks|thank you|and|so)\b.*\b(check|look|show|again|now)\b",
+        lowered,
+    ):
+        return True
+    if re.match(r"^\s*(what|did|how|and)\b", lowered) and re.search(
+        r"\b(today|tomorrow|week|month|on)\b", lowered
+    ):
+        return True
+    return False
+
+
 def _is_calendar_confirmation_required_items(items: list) -> bool:
     if len(items) != 1:
         return False
@@ -1373,9 +1541,16 @@ def _build_confirmed_gmail_send_request(pending_text: str, followup_text: str) -
 
 
 def _extract_draft_id_for_confirmation(text: str) -> str | None:
-    match = re.search(r"\bdraft(?:\s+id)?\s*[:#]?\s*([a-z0-9_-]{4,})\b", text, re.IGNORECASE)
+    match = re.search(
+        r"\bdraft(?:\s+id)?\s*[:#]?\s*([a-z0-9_-]{3,})\b",
+        text,
+        re.IGNORECASE,
+    )
     if not match:
-        return None
+        compose_match = re.search(r"\bcompose=([a-z0-9_-]{3,})\b", text, re.IGNORECASE)
+        if not compose_match:
+            return None
+        return compose_match.group(1).strip()
     return match.group(1).strip()
 
 
@@ -1399,6 +1574,12 @@ def _extract_gmail_send_pending_text(items: list, fallback: str) -> str:
         title = str(getattr(items[0], "title", "")).strip().lower()
         if title == "send confirmation required":
             snippet = str(getattr(items[0], "snippet", "")).strip()
+            item_url = str(getattr(items[0], "url", "")).strip()
+            draft_id = _extract_draft_id_for_confirmation(snippet)
+            if not draft_id:
+                draft_id = _extract_draft_id_for_confirmation(item_url)
+            if draft_id:
+                return f"confirm send draft {draft_id}"
             if snippet:
                 return snippet
     return fallback

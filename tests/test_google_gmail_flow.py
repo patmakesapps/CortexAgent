@@ -48,10 +48,10 @@ class _FakeConfirmingGoogleGmailTool(Tool):
                     url="https://mail.google.com/mail/u/0/#drafts?compose=r-1",
                     snippet=(
                         "I am ready to send this draft:\n"
-                        "- Draft ID: r-1\n"
                         "- To: me@example.com\n"
                         "- Subject: Re: Test\n"
-                        "Reply with 'confirm send draft r-1' to send, or 'cancel' to stop."
+                        "- Body: Thanks for your message.\n"
+                        "Reply with 'confirm' to send, or 'cancel' to stop."
                     ),
                 )
             ],
@@ -115,6 +115,22 @@ class GoogleGmailFlowTests(unittest.TestCase):
         )
         self.assertEqual(result.action, "google_gmail")
 
+    def test_router_picks_google_gmail_for_check_email_phrase(self):
+        result = decide_action(
+            user_text="check my email",
+            tools_enabled=True,
+            web_search_enabled=True,
+        )
+        self.assertEqual(result.action, "google_gmail")
+
+    def test_router_picks_google_gmail_for_send_email_phrase(self):
+        result = decide_action(
+            user_text="send an email to anthony@example.com",
+            tools_enabled=True,
+            web_search_enabled=True,
+        )
+        self.assertEqual(result.action, "google_gmail")
+
     def test_orchestrator_handles_gmail_send_confirmation_followup(self):
         account = _active_account()
         resolved = ResolvedProviderToken(
@@ -161,7 +177,7 @@ class GoogleGmailFlowTests(unittest.TestCase):
                 authorization="Bearer token",
             )
 
-        self.assertIn("Reply with 'confirm send draft r-1' to send", first.response)
+        self.assertIn("Reply with 'confirm' to send", first.response)
         self.assertIn("Gmail sent successfully", second.response)
         self.assertIn("Message id: msg-1", second.response)
 

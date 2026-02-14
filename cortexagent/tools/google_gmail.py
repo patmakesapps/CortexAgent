@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from email.message import EmailMessage
 from email.utils import formatdate
+from html import unescape as html_unescape
 import json
 import re
 from urllib import error as urlerror
@@ -10,6 +11,15 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from .base import Tool, ToolContext, ToolResult, ToolResultItem
+
+
+EXCLUDED_GMAIL_INBOX_LABELS = {
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+    "SPAM",
+}
 
 
 class GoogleGmailTool(Tool):
@@ -29,6 +39,7 @@ class GoogleGmailTool(Tool):
         user_text = (context.user_text or "").strip()
         if not user_text:
             return ToolResult(tool_name=self.name, query="", items=[])
+        inbox_query = _build_inbox_query(user_text)
 
         allowed_domains = _parse_allowed_domains(tool_meta.get("allowed_recipient_domains"))
 
@@ -47,20 +58,50 @@ class GoogleGmailTool(Tool):
             )
             return ToolResult(tool_name=self.name, query=user_text, items=[sent])
 
+        if _is_send_new_email_intent(user_text):
+            pending = self._build_send_confirmation_for_new_email(
+                access_token=token,
+                user_text=user_text,
+                allowed_domains=allowed_domains,
+            )
+            return ToolResult(tool_name=self.name, query=user_text, items=[pending])
+
+        if _is_compose_new_email_intent(user_text):
+            drafted = self._draft_new_email(
+                access_token=token,
+                user_text=user_text,
+                allowed_domains=allowed_domains,
+            )
+            return ToolResult(tool_name=self.name, query=user_text, items=[drafted])
+
         if _is_draft_reply_intent(user_text):
             drafted = self._draft_reply(access_token=token, user_text=user_text)
             return ToolResult(tool_name=self.name, query=user_text, items=[drafted])
 
         if _is_read_message_intent(user_text):
-            read_item = self._read_message(access_token=token, user_text=user_text)
+            read_item = self._read_message(
+                access_token=token,
+                user_text=user_text,
+                inbox_query=inbox_query,
+            )
             return ToolResult(tool_name=self.name, query=user_text, items=[read_item])
 
         max_results = _extract_max_results(user_text=user_text, default=5, minimum=1, maximum=15)
-        threads = self._list_recent_threads(access_token=token, max_results=max_results)
+        threads = self._list_recent_threads(
+            access_token=token,
+            max_results=max_results,
+            inbox_query=inbox_query,
+        )
         return ToolResult(tool_name=self.name, query=user_text, items=threads)
 
-    def _list_recent_threads(self, access_token: str, max_results: int) -> list[ToolResultItem]:
-        params = urlparse.urlencode({"maxResults": str(max_results), "q": "in:inbox"})
+    def _list_recent_threads(
+        self,
+        access_token: str,
+        max_results: int,
+        inbox_query: str,
+    ) -> list[ToolResultItem]:
+        fetch_limit = min(max(max_results * 3, max_results), 50)
+        params = urlparse.urlencode({"maxResults": str(fetch_limit), "q": inbox_query})
         url = f"{self.GMAIL_THREADS_URL}?{params}"
         payload = _api_request_json(
             url=url,
@@ -81,6 +122,8 @@ class GoogleGmailTool(Tool):
             if not thread_id:
                 continue
             details = self._get_thread_metadata(access_token=access_token, thread_id=thread_id)
+            if _has_excluded_inbox_labels(details.get("label_ids") or ""):
+                continue
             subject = details.get("subject") or "(no subject)"
             sender = details.get("from") or "Unknown sender"
             snippet = details.get("snippet") or ""
@@ -91,9 +134,11 @@ class GoogleGmailTool(Tool):
                     snippet=f"From: {sender} | {snippet}".strip(" |"),
                 )
             )
+            if len(out) >= max_results:
+                break
         return out
 
-    def _read_message(self, access_token: str, user_text: str) -> ToolResultItem:
+    def _read_message(self, access_token: str, user_text: str, inbox_query: str) -> ToolResultItem:
         thread_id = _extract_thread_id(user_text)
         if thread_id:
             details = self._get_thread_metadata(
@@ -103,7 +148,11 @@ class GoogleGmailTool(Tool):
             )
             return self._build_read_item(thread_id=thread_id, details=details)
 
-        newest_threads = self._list_recent_threads(access_token=access_token, max_results=1)
+        newest_threads = self._list_recent_threads(
+            access_token=access_token,
+            max_results=1,
+            inbox_query=inbox_query,
+        )
         if not newest_threads:
             raise RuntimeError("I could not find any inbox threads to read.")
         newest_title = newest_threads[0].title
@@ -196,6 +245,73 @@ class GoogleGmailTool(Tool):
             ),
         )
 
+    def _draft_new_email(
+        self,
+        access_token: str,
+        user_text: str,
+        allowed_domains: set[str],
+    ) -> ToolResultItem:
+        to_addr, subject, body = _extract_new_email_fields(user_text)
+        _enforce_allowed_recipient_domains(to_addr=to_addr, allowed_domains=allowed_domains)
+        raw = _build_new_email_rfc822_raw(to_addr=to_addr, subject=subject, body=body)
+        payload = {"message": {"raw": raw}}
+        created = _api_request_json(
+            url=self.GMAIL_DRAFTS_URL,
+            method="POST",
+            access_token=access_token,
+            timeout=8,
+            service_name="Gmail",
+            body=payload,
+        )
+        draft_id = str(created.get("id") or "").strip() if isinstance(created, dict) else ""
+        if not draft_id:
+            raise RuntimeError("Gmail returned an unexpected draft payload.")
+        safe_preview, flagged = _sanitize_email_text(body)
+        preview_note = (
+            "\n[Security] Prompt-injection-like lines were removed from the draft preview."
+            if flagged
+            else ""
+        )
+        return ToolResultItem(
+            title="[Drafted] New email",
+            url=f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}",
+            snippet=(
+                f"Draft id: {draft_id} | To: {to_addr} | Subject: {subject}\n"
+                f"Preview: {safe_preview[:220]}{preview_note}"
+            ),
+        )
+
+    def _build_send_confirmation_for_new_email(
+        self,
+        access_token: str,
+        user_text: str,
+        allowed_domains: set[str],
+    ) -> ToolResultItem:
+        drafted = self._draft_new_email(
+            access_token=access_token,
+            user_text=user_text,
+            allowed_domains=allowed_domains,
+        )
+        draft_id = _extract_draft_id(drafted.snippet or "") or _extract_draft_id(drafted.url or "")
+        if not draft_id:
+            raise RuntimeError("Could not resolve the draft id for send confirmation.")
+        to_addr, subject, body = _extract_new_email_fields(user_text)
+        safe_body, flagged = _sanitize_email_text(body)
+        body_line = safe_body[:240] if safe_body else "(empty body)"
+        if flagged:
+            body_line += " [sanitized]"
+        return ToolResultItem(
+            title="Send confirmation required",
+            url=f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}",
+            snippet=(
+                "I am ready to send this draft:\n"
+                f"- To: {to_addr or 'unknown'}\n"
+                f"- Subject: {subject}\n"
+                f"- Body: {body_line}\n"
+                "Reply with 'confirm' to send, or 'cancel' to stop."
+            ),
+        )
+
     def _build_send_confirmation_item(
         self,
         access_token: str,
@@ -210,17 +326,21 @@ class GoogleGmailTool(Tool):
         draft_details = self._get_draft(access_token=access_token, draft_id=draft_id)
         to_addr = draft_details.get("to") or ""
         subject = draft_details.get("subject") or "(no subject)"
+        body = draft_details.get("body") or ""
+        safe_body, flagged = _sanitize_email_text(body)
+        body_line = safe_body[:240] if safe_body else "(empty body)"
+        if flagged:
+            body_line += " [sanitized]"
         _enforce_allowed_recipient_domains(to_addr=to_addr, allowed_domains=allowed_domains)
         return ToolResultItem(
             title="Send confirmation required",
             url=f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}",
             snippet=(
                 "I am ready to send this draft:\n"
-                f"- Draft ID: {draft_id}\n"
                 f"- To: {to_addr or 'unknown'}\n"
                 f"- Subject: {subject}\n"
-                "Reply with 'confirm send draft "
-                f"{draft_id}' to send, or 'cancel' to stop."
+                f"- Body: {body_line}\n"
+                "Reply with 'confirm' to send, or 'cancel' to stop."
             ),
         )
 
@@ -263,7 +383,7 @@ class GoogleGmailTool(Tool):
         )
 
     def _get_draft(self, access_token: str, draft_id: str) -> dict[str, str]:
-        url = f"{self.GMAIL_DRAFTS_URL}/{draft_id}?format=metadata"
+        url = f"{self.GMAIL_DRAFTS_URL}/{draft_id}?format=full"
         payload = _api_request_json(
             url=url,
             method="GET",
@@ -277,9 +397,11 @@ class GoogleGmailTool(Tool):
         if not isinstance(message, dict):
             raise RuntimeError("Could not resolve draft message metadata.")
         headers = _headers_to_map(message)
+        body_text = _extract_message_text(message)
         return {
             "to": headers.get("to", ""),
             "subject": headers.get("subject", ""),
+            "body": body_text,
         }
 
     def _get_thread_metadata(
@@ -313,6 +435,12 @@ class GoogleGmailTool(Tool):
         reply_to_header = headers.get("reply-to", "")
         message_id = headers.get("message-id", "")
         subject = headers.get("subject", "")
+        label_ids_raw = latest.get("labelIds", [])
+        label_ids: list[str] = []
+        if isinstance(label_ids_raw, list):
+            for label in label_ids_raw:
+                if isinstance(label, str) and label.strip():
+                    label_ids.append(label.strip())
 
         body_text = ""
         if include_body:
@@ -325,6 +453,7 @@ class GoogleGmailTool(Tool):
             "reply_to": _extract_first_email(reply_to_header),
             "snippet": snippet,
             "body": body_text,
+            "label_ids": ",".join(label_ids),
         }
         if include_message_ids:
             out["message_id"] = message_id
@@ -340,6 +469,19 @@ def _extract_max_results(user_text: str, default: int, minimum: int, maximum: in
     except ValueError:
         return default
     return min(maximum, max(minimum, value))
+
+
+def _build_inbox_query(user_text: str) -> str:
+    _ = user_text
+    return (
+        "in:inbox category:primary "
+        "-category:promotions -category:social -category:updates -category:forums"
+    )
+
+
+def _has_excluded_inbox_labels(raw_labels: str) -> bool:
+    labels = {value.strip().upper() for value in raw_labels.split(",") if value.strip()}
+    return bool(labels.intersection(EXCLUDED_GMAIL_INBOX_LABELS))
 
 
 def _is_read_message_intent(text: str) -> bool:
@@ -361,6 +503,28 @@ def _is_draft_reply_intent(text: str) -> bool:
 def _is_send_intent(text: str) -> bool:
     lowered = text.strip().lower()
     return bool(re.search(r"\b(send)\b", lowered) and re.search(r"\bdraft\b", lowered))
+
+
+def _is_send_new_email_intent(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return bool(
+        re.search(r"\bsend\b", lowered)
+        and re.search(r"\b(email|gmail|message)\b", lowered)
+        and re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", lowered)
+    )
+
+
+def _is_compose_new_email_intent(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return bool(
+        re.search(r"\b(draft|compose|write)\b", lowered)
+        and re.search(r"\b(email|gmail|message)\b", lowered)
+        and re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", lowered)
+    )
 
 
 def _has_explicit_send_confirmation(text: str) -> bool:
@@ -391,9 +555,17 @@ def _extract_thread_id(text: str) -> str | None:
 
 
 def _extract_draft_id(text: str) -> str | None:
-    match = re.search(r"\bdraft\s+([a-z0-9_-]{4,})\b", text.strip(), flags=re.IGNORECASE)
+    cleaned = text.strip()
+    match = re.search(
+        r"\bdraft(?:\s+id)?\s*[:#]?\s*([a-z0-9_-]{3,})\b",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     if match:
         return match.group(1).strip()
+    compose_match = re.search(r"\bcompose=([a-z0-9_-]{3,})\b", cleaned, flags=re.IGNORECASE)
+    if compose_match:
+        return compose_match.group(1).strip()
     return None
 
 
@@ -402,6 +574,85 @@ def _extract_reply_body(text: str) -> str:
     if len(parts) < 2:
         return ""
     return parts[1].strip()
+
+
+def _extract_new_email_fields(text: str) -> tuple[str, str, str]:
+    cleaned = _normalize_quote_chars(text)
+    to_addr = _extract_first_email(cleaned)
+    if not to_addr:
+        raise RuntimeError("Please include a recipient email address, e.g. 'to name@example.com'.")
+
+    subject = _extract_subject_text(cleaned)
+    if not subject:
+        raise RuntimeError(
+            "Please include a subject, e.g. 'subject \"Hello\"' or 'subject: Hello'."
+        )
+
+    body = _extract_body_text(cleaned)
+    if not body:
+        raise RuntimeError(
+            "Please include a body, e.g. 'body \"Thanks for your time.\"' or 'body: ...'."
+        )
+    return to_addr, subject, body
+
+
+def _extract_subject_text(text: str) -> str:
+    quoted = re.search(
+        r"\bsubject(?:\s+to\s+be|\s+is)?\s*[:=\-]?\s*\"([^\"]{1,300})\"",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if quoted:
+        return quoted.group(1).strip()
+    inline = re.search(
+        r"\bsubject(?:\s+to\s+be|\s+is)?\s*[:=\-]?\s*([^\n|]{1,300})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not inline:
+        return ""
+    candidate = re.split(
+        r"\b(?:and\s+the\s+email\s+body|and\s+body|body(?:\s+can\s+say|\s+is)?)\b",
+        inline.group(1),
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return candidate.strip(" -:;,.")
+
+
+def _extract_body_text(text: str) -> str:
+    quoted = re.search(
+        r"\b(?:email\s+)?body(?:\s+can\s+say|\s+should\s+say|\s+is)?\s*[:=\-]?\s*\"([^\"]{1,5000})\"",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if quoted:
+        return quoted.group(1).strip()
+    inline = re.search(
+        r"\b(?:email\s+)?body(?:\s+can\s+say|\s+should\s+say|\s+is)?\s*[:=\-]?\s*(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if inline:
+        return inline.group(1).strip().strip('"')
+    message_line = re.search(
+        r"\bmessage(?:\s+can\s+say|\s+should\s+say|\s+is)?\s*[:=\-]?\s*(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if message_line:
+        return message_line.group(1).strip().strip('"')
+    return ""
+
+
+def _normalize_quote_chars(text: str) -> str:
+    return (
+        (text or "")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
 
 
 def _headers_to_map(message_payload: dict[str, object]) -> dict[str, str]:
@@ -462,9 +713,20 @@ def _decode_base64url_to_text(raw: str) -> str:
     padded = raw + ("=" * (-len(raw) % 4))
     try:
         decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
-        return decoded.decode("utf-8", errors="replace")
+        text = decoded.decode("utf-8", errors="replace")
+        return _html_to_text_if_needed(text)
     except Exception:
         return ""
+
+
+def _html_to_text_if_needed(text: str) -> str:
+    lowered = (text or "").strip().lower()
+    if "<html" not in lowered and "<body" not in lowered and "<div" not in lowered:
+        return text
+    no_scripts = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", " ", text)
+    no_tags = re.sub(r"(?is)<[^>]+>", " ", no_scripts)
+    collapsed = re.sub(r"\s+", " ", html_unescape(no_tags)).strip()
+    return collapsed
 
 
 def _build_reply_rfc822_raw(
@@ -480,6 +742,16 @@ def _build_reply_rfc822_raw(
     if message_id:
         msg["In-Reply-To"] = message_id
         msg["References"] = message_id
+    msg.set_content(body)
+    raw = msg.as_bytes()
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _build_new_email_rfc822_raw(to_addr: str, subject: str, body: str) -> str:
+    msg = EmailMessage()
+    msg["To"] = to_addr
+    msg["Subject"] = (subject or "").strip() or "(no subject)"
+    msg["Date"] = formatdate(localtime=True)
     msg.set_content(body)
     raw = msg.as_bytes()
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")

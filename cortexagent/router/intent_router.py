@@ -158,8 +158,9 @@ def _matches_explicit_gmail_intent(text: str) -> bool:
     if not text:
         return False
     return bool(
-        re.search(r"\b(read|open|show|list)\b.*\b(email|inbox|thread|message)\b", text)
+        re.search(r"\b(read|open|show|list|check)\b.*\b(email|inbox|thread|message)\b", text)
         or re.search(r"\b(draft|compose|write)\b.*\b(reply|email)\b", text)
+        or re.search(r"\bsend\b.*\b(email|gmail|message)\b", text)
         or re.search(r"\bsend\b.*\bdraft\b", text)
     )
 
