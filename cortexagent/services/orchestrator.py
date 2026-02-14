@@ -15,7 +15,9 @@ class OrchestratorResult:
 
 
 class AgentOrchestrator:
-    def __init__(self, ltm_client: CortexLTMClient, tool_registry: ToolRegistry) -> None:
+    def __init__(
+        self, ltm_client: CortexLTMClient, tool_registry: ToolRegistry
+    ) -> None:
         self.ltm_client = ltm_client
         self.tool_registry = tool_registry
 
@@ -50,26 +52,31 @@ class AgentOrchestrator:
             )
 
         tool = self.tool_registry.get("web_search")
-        result = tool.run(ToolContext(thread_id=thread_id, user_text=text))
-        assistant_text, sources = _format_web_search_response(result.items)
+        try:
+            result = tool.run(ToolContext(thread_id=thread_id, user_text=text))
+        except Exception as exc:
+            assistant_text = (
+                "I routed this request to web search, but the search providers failed. "
+                f"Error: {exc}"
+            )
+            return OrchestratorResult(
+                response=assistant_text,
+                decision=AgentDecision(
+                    action="web_search",
+                    reason="web_search_failed",
+                    confidence=1.0,
+                ),
+                sources=[],
+            )
 
-        self.ltm_client.add_event(
+        assistant_text, sources = _format_web_search_response(result.items)
+        self._persist_web_search_events(
             thread_id=thread_id,
-            actor="user",
-            content=text,
-            meta={"source": "cortexagent", "decision": route.action},
-            authorization=authorization,
-        )
-        self.ltm_client.add_event(
-            thread_id=thread_id,
-            actor="assistant",
-            content=assistant_text,
-            meta={
-                "source": "cortexagent_web_search",
-                "tool": result.tool_name,
-                "query": result.query,
-                "source_urls": [s["url"] for s in sources],
-            },
+            user_text=text,
+            assistant_text=assistant_text,
+            tool_name=result.tool_name,
+            query=result.query,
+            sources=sources,
             authorization=authorization,
         )
 
@@ -82,6 +89,44 @@ class AgentOrchestrator:
             ),
             sources=sources,
         )
+
+    def _persist_web_search_events(
+        self,
+        thread_id: str,
+        user_text: str,
+        assistant_text: str,
+        tool_name: str,
+        query: str,
+        sources: list[dict[str, str]],
+        authorization: str | None,
+    ) -> None:
+        # Best effort persistence: tool responses should still return even if writes fail.
+        try:
+            self.ltm_client.add_event(
+                thread_id=thread_id,
+                actor="user",
+                content=user_text,
+                meta={"source": "cortexagent", "decision": "web_search"},
+                authorization=authorization,
+            )
+        except Exception:
+            pass
+
+        try:
+            self.ltm_client.add_event(
+                thread_id=thread_id,
+                actor="assistant",
+                content=assistant_text,
+                meta={
+                    "source": "cortexagent_web_search",
+                    "tool": tool_name,
+                    "query": query,
+                    "source_urls": [s["url"] for s in sources],
+                },
+                authorization=authorization,
+            )
+        except Exception:
+            pass
 
 
 def _format_web_search_response(items: list) -> tuple[str, list[dict[str, str]]]:
