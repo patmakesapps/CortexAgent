@@ -5,19 +5,48 @@ from urllib import request as urlrequest
 
 from cortexagent.config import settings
 
-WEB_CUE_TERMS = (
+EXPLICIT_WEB_INTENT_TERMS = (
+    "web search",
+    "search the web",
+    "search online",
+    "look up",
+    "lookup",
+    "google",
+    "check online",
+    "find online",
+    "show links",
+    "send links",
+    "show sources",
+    "source links",
+    "citations",
+)
+
+TIME_SENSITIVE_FACT_TERMS = (
     "latest",
     "today",
     "news",
-    "current",
     "price",
-    "look up",
-    "search",
-    "web",
-    "online",
-    "recent",
-    "release",
-    "update",
+    "stock",
+    "crypto",
+    "weather",
+    "score",
+    "schedule",
+    "release date",
+    "version",
+    "outage",
+    "policy change",
+)
+
+NON_WEB_TASK_TERMS = (
+    "write code",
+    "debug",
+    "refactor",
+    "explain this code",
+    "summarize",
+    "rewrite",
+    "translate",
+    "brainstorm",
+    "draft",
 )
 
 
@@ -30,13 +59,28 @@ class RouteDecision:
 
 def _keyword_decision(user_text: str) -> RouteDecision:
     text = user_text.strip().lower()
-    if any(term in text for term in WEB_CUE_TERMS):
+    if any(term in text for term in EXPLICIT_WEB_INTENT_TERMS):
         return RouteDecision(
             action="web_search",
-            reason="matched_web_cue",
-            confidence=0.9,
+            reason="matched_explicit_web_intent",
+            confidence=0.95,
         )
+    if any(term in text for term in NON_WEB_TASK_TERMS):
+        return RouteDecision(action="chat", reason="matched_non_web_task", confidence=0.9)
+    if _looks_like_time_sensitive_fact_request(text):
+        return RouteDecision(action="web_search", reason="matched_time_sensitive_fact", confidence=0.84)
     return RouteDecision(action="chat", reason="default_chat", confidence=0.75)
+
+
+def _looks_like_time_sensitive_fact_request(text: str) -> bool:
+    question_like = (
+        "?" in text
+        or text.startswith(("what", "who", "when", "where", "how", "is", "are", "does", "do", "did", "can"))
+        or "tell me" in text
+    )
+    if not question_like:
+        return False
+    return any(term in text for term in TIME_SENSITIVE_FACT_TERMS)
 
 
 def _extract_json(content: str) -> dict[str, object]:

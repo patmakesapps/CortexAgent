@@ -48,6 +48,7 @@ class AgentOrchestrator:
             and settings.agent_tools_enabled
             and settings.web_search_enabled
             and route.action != "web_search"
+            and _should_force_verification_web_search(text, verification.reasons)
         ):
             route = RouteDecision(
                 action="web_search",
@@ -571,3 +572,33 @@ def _friendly_local_timestamp() -> str:
     local_now = datetime.now().astimezone()
     stamp = local_now.strftime("%b %d, %Y at %I:%M %p %Z")
     return stamp.replace(" at 0", " at ")
+
+
+def _should_force_verification_web_search(user_text: str, reasons: list[str]) -> bool:
+    # Only force web search for genuinely high-risk factual requests.
+    if "high_stakes" not in reasons:
+        return False
+
+    text = re.sub(r"\s+", " ", user_text.strip().lower())
+    if not text:
+        return False
+
+    if any(
+        cue in text
+        for cue in (
+            "write",
+            "draft",
+            "brainstorm",
+            "summarize",
+            "rewrite",
+            "translate",
+            "debug",
+            "code",
+            "refactor",
+        )
+    ):
+        return False
+
+    return "?" in text or text.startswith(
+        ("what", "who", "when", "where", "how", "is", "are", "does", "do", "did", "can")
+    )

@@ -105,27 +105,45 @@ def enforce_verification_policy(
 
     independent_count = _count_independent_sources(sources)
     if independent_count < profile.min_independent_sources:
-        return (
+        base = (
             "I cannot verify this high-risk request with enough independent sources yet. "
             "Please retry in a moment or check authoritative primary sources directly."
         )
+        return _append_sources(base, sources)
 
     if _is_numeric_sensitive(user_text):
         response_values = _extract_money_values(assistant_text)
         source_values = _extract_money_values_from_sources(sources)
         if response_values and not source_values:
-            return (
+            base = (
                 "I cannot verify the numeric value with reliable source evidence right now. "
                 "Please check the linked primary sources directly."
             )
+            return _append_sources(base, sources)
         if response_values and source_values and _has_money_mismatch(response_values, source_values):
-            return (
+            base = (
                 "I found conflicting numeric values across sources, so I cannot provide a single "
                 "verified number right now. Please use the linked primary sources."
             )
+            return _append_sources(base, sources)
 
     stamp = _friendly_local_timestamp()
     return f"As of {stamp}, verified against {independent_count} independent sources.\n{assistant_text}"
+
+
+def _append_sources(base_text: str, sources: list[dict[str, str]]) -> str:
+    lines = [base_text]
+    if not sources:
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("Sources:")
+    for src in sources[:5]:
+        title = (src.get("title", "") or "").strip() or "Source"
+        url = (src.get("url", "") or "").strip()
+        if not url:
+            continue
+        lines.append(f"- {title}: {url}")
+    return "\n".join(lines)
 
 
 def _looks_factual(text: str) -> bool:
