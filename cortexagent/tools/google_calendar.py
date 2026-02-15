@@ -228,15 +228,22 @@ def _has_explicit_write_confirmation(text: str) -> bool:
     lowered = (text or "").strip().lower()
     if not lowered:
         return False
-    confirmation_terms = (
-        "confirm:",
-        "confirm ",
-        "yes, create",
-        "yes create",
-        "go ahead and create",
-        "proceed to create",
+    normalized = re.sub(r"\s+", " ", lowered).strip()
+    if normalized in {"confirm", "yes create", "go ahead and create", "proceed to create"}:
+        return True
+    if normalized.startswith("confirm:"):
+        return True
+    if re.match(
+        r"^\s*confirm\s+(?:add|create|schedule|book|set up|put)\b",
+        normalized,
+    ):
+        return True
+    return bool(
+        re.match(
+            r"^\s*(?:yes|ok|okay)\s*,?\s*(?:add|create|schedule|book|proceed)\b",
+            normalized,
+        )
     )
-    return any(term in lowered for term in confirmation_terms)
 
 
 def _strip_confirmation_prefix(text: str) -> str:

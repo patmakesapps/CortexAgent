@@ -10,6 +10,8 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+from cortexagent.config import settings
+
 from .base import Tool, ToolContext, ToolResult, ToolResultItem
 
 
@@ -42,6 +44,7 @@ class GoogleGmailTool(Tool):
         inbox_query = _build_inbox_query(user_text)
 
         allowed_domains = _parse_allowed_domains(tool_meta.get("allowed_recipient_domains"))
+        parsed_new_email: tuple[str, str, str, bool] | None = None
 
         if _is_send_intent(user_text):
             if not _has_explicit_send_confirmation(user_text):
@@ -59,18 +62,23 @@ class GoogleGmailTool(Tool):
             return ToolResult(tool_name=self.name, query=user_text, items=[sent])
 
         if _is_send_new_email_intent(user_text):
+            parsed_new_email = _extract_new_email_fields_detailed(user_text)
             pending = self._build_send_confirmation_for_new_email(
                 access_token=token,
                 user_text=user_text,
                 allowed_domains=allowed_domains,
+                parsed_email=parsed_new_email,
             )
             return ToolResult(tool_name=self.name, query=user_text, items=[pending])
 
         if _is_compose_new_email_intent(user_text):
+            if parsed_new_email is None:
+                parsed_new_email = _extract_new_email_fields_detailed(user_text)
             drafted = self._draft_new_email(
                 access_token=token,
                 user_text=user_text,
                 allowed_domains=allowed_domains,
+                parsed_email=parsed_new_email,
             )
             return ToolResult(tool_name=self.name, query=user_text, items=[drafted])
 
@@ -255,7 +263,7 @@ class GoogleGmailTool(Tool):
             title=f"[Drafted] Thread {thread_id}",
             url=f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}",
             snippet=(
-                f"Draft id: {draft_id} | To: {to_addr} | Subject: {_ensure_reply_subject(subject)}\n"
+                f"To: {to_addr} | Subject: {_ensure_reply_subject(subject)}\n"
                 f"Preview: {safe_preview[:220]}{preview_note}"
             ),
         )
@@ -265,8 +273,11 @@ class GoogleGmailTool(Tool):
         access_token: str,
         user_text: str,
         allowed_domains: set[str],
+        parsed_email: tuple[str, str, str, bool] | None = None,
     ) -> ToolResultItem:
-        to_addr, subject, body = _extract_new_email_fields(user_text)
+        to_addr, subject, body, llm_used = parsed_email or _extract_new_email_fields_detailed(
+            user_text
+        )
         _enforce_allowed_recipient_domains(to_addr=to_addr, allowed_domains=allowed_domains)
         raw = _build_new_email_rfc822_raw(to_addr=to_addr, subject=subject, body=body)
         payload = {"message": {"raw": raw}}
@@ -287,11 +298,12 @@ class GoogleGmailTool(Tool):
             if flagged
             else ""
         )
+        composer_note = " | Composer: LLM-assisted" if llm_used else ""
         return ToolResultItem(
             title="[Drafted] New email",
             url=f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}",
             snippet=(
-                f"Draft id: {draft_id} | To: {to_addr} | Subject: {subject}\n"
+                f"To: {to_addr} | Subject: {subject}{composer_note}\n"
                 f"Preview: {safe_preview[:220]}{preview_note}"
             ),
         )
@@ -301,20 +313,24 @@ class GoogleGmailTool(Tool):
         access_token: str,
         user_text: str,
         allowed_domains: set[str],
+        parsed_email: tuple[str, str, str, bool] | None = None,
     ) -> ToolResultItem:
+        parsed = parsed_email or _extract_new_email_fields_detailed(user_text)
         drafted = self._draft_new_email(
             access_token=access_token,
             user_text=user_text,
             allowed_domains=allowed_domains,
+            parsed_email=parsed,
         )
         draft_id = _extract_draft_id(drafted.snippet or "") or _extract_draft_id(drafted.url or "")
         if not draft_id:
             raise RuntimeError("Could not resolve the draft id for send confirmation.")
-        to_addr, subject, body = _extract_new_email_fields(user_text)
+        to_addr, subject, body, llm_used = parsed
         safe_body, flagged = _sanitize_email_text(body)
         body_line = safe_body[:240] if safe_body else "(empty body)"
         if flagged:
             body_line += " [sanitized]"
+        composer_line = "- Composer: LLM-assisted\n" if llm_used else ""
         return ToolResultItem(
             title="Send confirmation required",
             url=f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}",
@@ -322,6 +338,7 @@ class GoogleGmailTool(Tool):
                 "I am ready to send this draft:\n"
                 f"- To: {to_addr or 'unknown'}\n"
                 f"- Subject: {subject}\n"
+                f"{composer_line}"
                 f"- Body: {body_line}\n"
                 "Reply with 'confirm' to send, or 'cancel' to stop."
             ),
@@ -392,9 +409,9 @@ class GoogleGmailTool(Tool):
             else "https://mail.google.com/mail/u/0/#inbox"
         )
         return ToolResultItem(
-            title=f"[Sent] Draft {draft_id}",
+            title="[Sent] Email",
             url=thread_link,
-            snippet=f"Message id: {message_id} | To: {to_addr or 'unknown'}",
+            snippet=f"To: {to_addr or 'unknown'}",
         )
 
     def _get_draft(self, access_token: str, draft_id: str) -> dict[str, str]:
@@ -535,11 +552,15 @@ def _is_send_new_email_intent(text: str) -> bool:
         return False
     if not _contains_email_address(lowered):
         return False
+    # "draft ..." should stay draft-only unless user also asks to send.
+    if re.search(r"\bdraft\b", lowered) and not re.search(r"\b(send|sned|snd)\b", lowered):
+        return False
     if re.search(r"\b(send|sned|snd)\b", lowered):
         return True
-    if re.search(r"\b(draft|compose|write)\b", lowered):
-        return False
-    # Support imperative phrasing like "email person@example.com and say ...".
+    # Support imperative phrasing like:
+    # "email person@example.com and write ...", "compose an email to ...", "email ... and say ..."
+    if re.search(r"\b(email|compose|write|tell)\b", lowered):
+        return True
     if re.search(
         r"\bemail\s+(?:to\s+)?[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b",
         lowered,
@@ -664,6 +685,11 @@ def _extract_reply_body(text: str) -> str:
 
 
 def _extract_new_email_fields(text: str) -> tuple[str, str, str]:
+    to_addr, subject, body, _llm_used = _extract_new_email_fields_detailed(text)
+    return to_addr, subject, body
+
+
+def _extract_new_email_fields_detailed(text: str) -> tuple[str, str, str, bool]:
     cleaned = _normalize_quote_chars(text)
     to_addr = _extract_first_email(cleaned)
     if not to_addr:
@@ -673,6 +699,7 @@ def _extract_new_email_fields(text: str) -> tuple[str, str, str]:
     body = _extract_body_text(cleaned, known_subject=subject)
     if not body:
         body = _extract_freeform_body_text(cleaned, known_subject=subject)
+    body = _trim_non_email_followup_fragments(body)
     body = _normalize_extracted_field(body, max_len=5000)
     if not body:
         raise RuntimeError(
@@ -682,12 +709,213 @@ def _extract_new_email_fields(text: str) -> tuple[str, str, str]:
     if not subject:
         subject = _infer_subject_text(cleaned, body)
     subject = _normalize_extracted_field(subject, max_len=300) or "Quick note"
+
+    llm_used = False
+    should_use_composer = _should_use_llm_email_composer(cleaned, subject=subject, body=body)
+    if should_use_composer:
+        llm_result = _llm_compose_email_fields(
+            user_text=cleaned,
+            fallback_to=to_addr,
+            fallback_subject=subject,
+            fallback_body=body,
+        )
+        if llm_result is not None:
+            llm_to, llm_subject, llm_body = llm_result
+            to_addr = llm_to or to_addr
+            subject = _normalize_extracted_field(llm_subject, max_len=300) or subject
+            body = _normalize_extracted_field(llm_body, max_len=5000) or body
+            llm_used = True
+        else:
+            subject, body = _compose_email_fields_fallback(
+                user_text=cleaned,
+                fallback_subject=subject,
+                fallback_body=body,
+            )
+
     if _looks_like_ambiguous_new_email_parse(body=body, subject=subject):
         raise RuntimeError(
             "I couldn’t confidently parse the email body. "
             "Please provide it as: say \"...\" (and optional subject \"...\")."
         )
-    return to_addr, subject, body
+    return to_addr, subject, body, llm_used
+
+
+def _should_use_llm_email_composer(text: str, subject: str, body: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    explicit_compose_intent = bool(
+        re.search(
+            r"\b(compose|write|draft)\b.*\b(body|message|email)\b",
+            lowered,
+        )
+    )
+    body_quality_issue = bool(
+        body.strip().lower().endswith("then")
+        or body.strip().lower().endswith("and")
+        or " then add " in body.lower()
+        or " add it to my calendar" in body.lower()
+        or " compose the body" in lowered
+        or " in the email make the subject" in lowered
+    )
+    return explicit_compose_intent or body_quality_issue
+
+
+def _llm_compose_email_fields(
+    user_text: str,
+    fallback_to: str,
+    fallback_subject: str,
+    fallback_body: str,
+) -> tuple[str, str, str] | None:
+    if not settings.groq_api_key:
+        return None
+
+    prompt = (
+        "You are an email drafting assistant.\n"
+        "Return strict JSON only with keys: to, subject, body.\n"
+        "Rules:\n"
+        "- Keep the recipient email exactly as requested.\n"
+        "- Ignore non-email tasks such as calendar actions.\n"
+        "- Subject should be concise and professional.\n"
+        "- Body should be clear, complete, and user-ready.\n"
+        "- Do not include markdown.\n"
+    )
+    payload = {
+        "model": settings.router_llm_model,
+        "temperature": 0.2,
+        "max_tokens": 240,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"User request:\n{user_text}\n\n"
+                    f"Fallback recipient: {fallback_to}\n"
+                    f"Fallback subject: {fallback_subject}\n"
+                    f"Fallback body: {fallback_body}\n"
+                ),
+            },
+        ],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.groq_api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=max(4, settings.router_llm_timeout_seconds)) as res:
+            response_payload = json.loads(res.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    content = (
+        response_payload.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    parsed = _extract_json_object(content)
+    if not isinstance(parsed, dict):
+        return None
+    to_addr = _normalize_extracted_field(str(parsed.get("to") or fallback_to), max_len=320).lower()
+    subject = _normalize_extracted_field(str(parsed.get("subject") or fallback_subject), max_len=300)
+    email_body = _normalize_extracted_field(str(parsed.get("body") or fallback_body), max_len=5000)
+    if not to_addr or "@" not in to_addr:
+        to_addr = fallback_to
+    if not subject:
+        subject = fallback_subject or "Quick note"
+    if not email_body:
+        email_body = fallback_body
+    if not email_body:
+        return None
+    return to_addr, subject, email_body
+
+
+def _compose_email_fields_fallback(
+    user_text: str,
+    fallback_subject: str,
+    fallback_body: str,
+) -> tuple[str, str]:
+    cleaned_user_text = _normalize_quote_chars(user_text or "")
+    subject = _normalize_extracted_field(
+        _trim_non_email_followup_fragments(fallback_subject),
+        max_len=300,
+    )
+    body_intent = _normalize_extracted_field(
+        _trim_non_email_followup_fragments(fallback_body),
+        max_len=5000,
+    )
+
+    body_intent = re.sub(
+        r"(?:\.\.\.|…|\bthen\b|\band then\b|\band\b)\s*$",
+        "",
+        body_intent,
+        flags=re.IGNORECASE,
+    ).strip(" .")
+    if not body_intent:
+        body_intent = "reaching out with a quick update"
+
+    lowered_request = cleaned_user_text.lower()
+    lowered_intent = body_intent.lower()
+
+    if not subject:
+        if re.search(r"\b(gratitude|grateful|appreciate|appreciation|thank)\b", lowered_request):
+            subject = "Thank You for the Opportunity"
+        else:
+            subject = _infer_subject_from_body(body_intent) or "Quick note"
+    subject = _normalize_extracted_field(subject, max_len=300) or "Quick note"
+    mention_gratitude = bool(
+        re.search(r"\b(gratitude|grateful|appreciate|appreciation|thank)\b", lowered_request)
+        or re.search(r"\b(gratitude|grateful|appreciate|appreciation|thank)\b", lowered_intent)
+    )
+    normalized_intent = re.sub(r"\bexcepted\b", "accepted", body_intent, flags=re.IGNORECASE).strip()
+    if lowered_intent.startswith("expressing my gratitude"):
+        normalized_intent = (
+            "I wanted to express my gratitude for the opportunity "
+            "and share how excited I am to move forward."
+        )
+
+    if normalized_intent and normalized_intent[-1] not in ".!?":
+        normalized_intent = f"{normalized_intent}."
+    if normalized_intent:
+        normalized_intent = normalized_intent[0].upper() + normalized_intent[1:]
+
+    gratitude_sentence = (
+        "Thank you again for the opportunity."
+        if mention_gratitude
+        else "Please let me know if you would like to discuss details or next steps."
+    )
+
+    composed = (
+        "Hi,\n\n"
+        f"{normalized_intent}\n\n"
+        f"{gratitude_sentence}\n\n"
+        "Best,\n"
+        "Patrick"
+    )
+    return subject, composed
+
+
+def _extract_json_object(content: str) -> dict[str, object] | None:
+    raw = (content or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        rows = raw.splitlines()
+        if len(rows) >= 3:
+            raw = "\n".join(rows[1:-1]).strip()
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
 
 
 def _extract_subject_text(text: str) -> str:
@@ -737,14 +965,14 @@ def _extract_body_text(text: str, known_subject: str = "") -> str:
     if message_line:
         return message_line.group(1).strip().strip('"')
     spoken_quoted = re.search(
-        r"\b(?:say|saying)\s*[:=\-]?\s*\"([^\"]{1,5000})\"",
+        r"\b(?:saying|say)\b\s*[:=\-]?\s*\"([^\"]{1,5000})\"",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if spoken_quoted:
         return spoken_quoted.group(1).strip()
     spoken_inline = re.search(
-        r"\b(?:say|saying)\s*[:=\-]?\s*(.+)$",
+        r"\b(?:saying|say)\b\s*[:=\-]?\s*(.+)$",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -755,7 +983,30 @@ def _extract_body_text(text: str, known_subject: str = "") -> str:
             maxsplit=1,
             flags=re.IGNORECASE,
         )[0]
-        return candidate.strip().strip('"')
+        return _trim_non_email_followup_fragments(candidate.strip().strip('"'))
+    tell_quoted = re.search(
+        r"\btell\s+(?:him|her|them)\s*[:=\-]?\s*\"([^\"]{1,5000})\"",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if tell_quoted:
+        return _trim_non_email_followup_fragments(tell_quoted.group(1).strip())
+    tell_inline = re.search(
+        r"\btell\s+(?:him|her|them)\s*[:=\-]?\s*(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if tell_inline:
+        return _trim_non_email_followup_fragments(tell_inline.group(1).strip().strip('"'))
+    let_them_know = re.search(
+        r"\blet\s+(?:him|her|them)\s+know\s*[:=\-]?\s*(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if let_them_know:
+        return _trim_non_email_followup_fragments(
+            let_them_know.group(1).strip().strip('"')
+        )
     quoted_chunks = re.findall(r"\"([^\"]{1,5000})\"", text, flags=re.DOTALL)
     for chunk in quoted_chunks:
         candidate = chunk.strip()
@@ -763,7 +1014,7 @@ def _extract_body_text(text: str, known_subject: str = "") -> str:
             continue
         if known_subject and candidate.lower() == known_subject.strip().lower():
             continue
-        return candidate
+        return _trim_non_email_followup_fragments(candidate)
     return ""
 
 
@@ -776,7 +1027,7 @@ def _extract_freeform_body_text(text: str, known_subject: str) -> str:
     if colon_style:
         candidate = colon_style.group(1).strip().strip('"')
         if not _looks_like_non_body_fragment(candidate, known_subject):
-            return candidate
+            return _trim_non_email_followup_fragments(candidate)
 
     candidate = text
     candidate = re.sub(
@@ -814,7 +1065,21 @@ def _extract_freeform_body_text(text: str, known_subject: str) -> str:
     candidate = re.sub(r"\s+", " ", candidate).strip(" \t\r\n\"'.,;:-")
     if _looks_like_non_body_fragment(candidate, known_subject):
         return ""
-    return candidate
+    return _trim_non_email_followup_fragments(candidate)
+
+
+def _trim_non_email_followup_fragments(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    patterns = (
+        r"\b(?:please\s+)?add\s+it\s+to\s+my\s+calendar\b.*$",
+        r"\b(?:and|also)\s+(?:please\s+)?(?:add|put|schedule|create|book)\b.*\bcalendar\b.*$",
+        r"\b(?:please\s+)?(?:add|put|schedule|create|book)\b.*\bcalendar\b.*$",
+    )
+    for pattern in patterns:
+        candidate = re.sub(pattern, "", candidate, flags=re.IGNORECASE | re.DOTALL).strip()
+    return candidate.strip(" .")
 
 
 def _infer_subject_text(text: str, body: str) -> str:

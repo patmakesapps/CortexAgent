@@ -34,6 +34,7 @@ class OrchestratorResult:
 class OrchestrationStep:
     action: str
     query: str
+    expected_outcome: str
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class OrchestrationStepResult:
     sources: list[dict[str, str]]
     success: bool
     reason: str
+    execution_status: str
     capability_label: str
     extra_meta: dict[str, object] | None = None
 
@@ -82,6 +84,60 @@ class AgentOrchestrator:
 
         pending_calendar_draft = self._pending_calendar_drafts.get(thread_id)
         pending_gmail_send = self._pending_gmail_send_requests.get(thread_id)
+        if pending_calendar_draft and pending_gmail_send:
+            if _is_calendar_cancel_reply(text) or _is_gmail_cancel_reply(text):
+                self._pending_calendar_drafts.pop(thread_id, None)
+                self._pending_gmail_send_requests.pop(thread_id, None)
+                response = (
+                    "Understood. I canceled both pending requests and did not send or add anything."
+                )
+                return OrchestratorResult(
+                    response=response,
+                    decision=AgentDecision(
+                        action="orchestration",
+                        reason="pending_multi_action_canceled",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+            if _is_calendar_pause_reply(text):
+                response = (
+                    "Understood. I will hold both pending requests. "
+                    "Reply with 'confirm' when you want me to execute both."
+                )
+                return OrchestratorResult(
+                    response=response,
+                    decision=AgentDecision(
+                        action="orchestration",
+                        reason="pending_multi_action_paused",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+            if _is_calendar_confirmation_reply(text) or _is_gmail_send_confirmation_reply(text):
+                return self._run_multi_step_pipeline(
+                    thread_id=thread_id,
+                    text=text,
+                    authorization=authorization,
+                    steps=[
+                        OrchestrationStep(
+                            action="google_gmail",
+                            query=_build_confirmed_gmail_send_request(
+                                pending_text=pending_gmail_send,
+                                followup_text=text,
+                            ),
+                            expected_outcome="gmail_send",
+                        ),
+                        OrchestrationStep(
+                            action="google_calendar",
+                            query=_build_confirmed_calendar_request(
+                                draft_text=pending_calendar_draft,
+                                followup_text=text,
+                            ),
+                            expected_outcome="calendar_write",
+                        ),
+                    ],
+                )
         if pending_calendar_draft and _is_calendar_cancel_reply(text):
             self._pending_calendar_drafts.pop(thread_id, None)
             response = "Understood. I canceled this calendar draft and did not add anything."
@@ -116,6 +172,20 @@ class AgentOrchestrator:
                 decision=AgentDecision(
                     action="google_gmail",
                     reason="gmail_send_canceled",
+                    confidence=1.0,
+                ),
+                sources=[],
+            )
+        if pending_gmail_send and _is_gmail_pending_status_followup(text):
+            response = (
+                "The email is still pending and has not been sent yet. "
+                "Reply with 'confirm' to send it, or 'cancel' to stop."
+            )
+            return OrchestratorResult(
+                response=response,
+                decision=AgentDecision(
+                    action="google_gmail",
+                    reason="gmail_send_pending_status",
                     confidence=1.0,
                 ),
                 sources=[],
@@ -831,9 +901,12 @@ class AgentOrchestrator:
                 authorization=authorization,
             )
             step_results.append(result)
-            if result.success and result.action in {"google_calendar", "google_gmail", "google_drive"}:
+            if (
+                result.execution_status in {"completed", "action_required"}
+                and result.action in {"google_calendar", "google_gmail", "google_drive"}
+            ):
                 self._last_tool_action_by_thread[thread_id] = result.action
-            if result.success and result.action == "web_search":
+            if result.execution_status == "completed" and result.action == "web_search":
                 self._last_web_search_query_by_thread[thread_id] = result.query
 
         combined_sources = _dedupe_sources_by_url(
@@ -874,6 +947,7 @@ class AgentOrchestrator:
     ) -> OrchestrationStepResult:
         action = step.action
         query = step.query
+        expected_outcome = step.expected_outcome
         if action == "google_calendar":
             tool_name = "google_calendar"
             capability_label = "Google Calendar"
@@ -891,6 +965,7 @@ class AgentOrchestrator:
                     sources=[],
                     success=False,
                     reason="google_calendar_auth_failed",
+                    execution_status="failed",
                     capability_label=capability_label,
                 )
             try:
@@ -911,14 +986,25 @@ class AgentOrchestrator:
                     )
                 elif _is_calendar_created_items(result.items):
                     self._pending_calendar_drafts.pop(thread_id, None)
+                execution_status, reason = _evaluate_calendar_step_execution(
+                    expected_outcome=expected_outcome,
+                    items=result.items,
+                )
+                assistant_text = _annotate_orchestration_step_text(
+                    action=action,
+                    expected_outcome=expected_outcome,
+                    execution_status=execution_status,
+                    assistant_text=assistant_text,
+                )
                 return OrchestrationStepResult(
                     action=action,
                     tool_name=result.tool_name,
                     query=result.query,
                     assistant_text=assistant_text,
                     sources=sources,
-                    success=True,
-                    reason="ok",
+                    success=execution_status == "completed",
+                    reason=reason,
+                    execution_status=execution_status,
                     capability_label=capability_label,
                     extra_meta=token_meta,
                 )
@@ -934,6 +1020,7 @@ class AgentOrchestrator:
                     sources=[],
                     success=False,
                     reason="google_calendar_failed",
+                    execution_status="failed",
                     capability_label=capability_label,
                 )
 
@@ -954,6 +1041,7 @@ class AgentOrchestrator:
                     sources=[],
                     success=False,
                     reason="google_gmail_auth_failed",
+                    execution_status="failed",
                     capability_label=capability_label,
                 )
             allowed_domains = [
@@ -983,14 +1071,25 @@ class AgentOrchestrator:
                     )
                 elif _is_gmail_sent_items(result.items):
                     self._pending_gmail_send_requests.pop(thread_id, None)
+                execution_status, reason = _evaluate_gmail_step_execution(
+                    expected_outcome=expected_outcome,
+                    items=result.items,
+                )
+                assistant_text = _annotate_orchestration_step_text(
+                    action=action,
+                    expected_outcome=expected_outcome,
+                    execution_status=execution_status,
+                    assistant_text=assistant_text,
+                )
                 return OrchestrationStepResult(
                     action=action,
                     tool_name=result.tool_name,
                     query=result.query,
                     assistant_text=assistant_text,
                     sources=sources,
-                    success=True,
-                    reason="ok",
+                    success=execution_status == "completed",
+                    reason=reason,
+                    execution_status=execution_status,
                     capability_label=capability_label,
                     extra_meta=token_meta,
                 )
@@ -1006,6 +1105,7 @@ class AgentOrchestrator:
                     sources=[],
                     success=False,
                     reason="google_gmail_failed",
+                    execution_status="failed",
                     capability_label=capability_label,
                 )
 
@@ -1026,6 +1126,7 @@ class AgentOrchestrator:
                     sources=[],
                     success=False,
                     reason="google_drive_auth_failed",
+                    execution_status="failed",
                     capability_label=capability_label,
                 )
             try:
@@ -1047,6 +1148,7 @@ class AgentOrchestrator:
                     sources=sources,
                     success=True,
                     reason="ok",
+                    execution_status="completed",
                     capability_label=capability_label,
                     extra_meta=token_meta,
                 )
@@ -1062,6 +1164,7 @@ class AgentOrchestrator:
                     sources=[],
                     success=False,
                     reason="google_drive_failed",
+                    execution_status="failed",
                     capability_label=capability_label,
                 )
 
@@ -1086,6 +1189,7 @@ class AgentOrchestrator:
                     sources=sources,
                     success=True,
                     reason="ok",
+                    execution_status="completed",
                     capability_label=capability_label,
                     extra_meta=None,
                 )
@@ -1101,6 +1205,7 @@ class AgentOrchestrator:
                     sources=[],
                     success=False,
                     reason="web_search_failed",
+                    execution_status="failed",
                     capability_label=capability_label,
                 )
 
@@ -1112,6 +1217,7 @@ class AgentOrchestrator:
             sources=[],
             success=False,
             reason="unsupported_step_action",
+            execution_status="failed",
             capability_label=_capability_label_for_action(action),
         )
 
@@ -1137,6 +1243,7 @@ class AgentOrchestrator:
                             "query": step.query,
                             "success": step.success,
                             "reason": step.reason,
+                            "execution_status": step.execution_status,
                         }
                         for step in step_results
                     ],
@@ -1162,6 +1269,16 @@ class AgentOrchestrator:
                             "id": step.action,
                             "type": "tool",
                             "label": step.capability_label,
+                        }
+                        for step in step_results
+                    ],
+                    "steps": [
+                        {
+                            "action": step.action,
+                            "toolName": step.tool_name,
+                            "success": step.success,
+                            "reason": step.reason,
+                            "executionStatus": step.execution_status,
                         }
                         for step in step_results
                     ],
@@ -1295,13 +1412,20 @@ def _format_google_calendar_response(
         and str(getattr(item, "title", "")).startswith("[Created] ")
         for item in items
     )
-    lines = (
-        ["Google Calendar updated. Upcoming events:"]
-        if has_created
-        else ["Upcoming Google Calendar events:"]
-    )
+    display_items = items
+    if has_created:
+        created_items = [
+            item
+            for item in items
+            if isinstance(getattr(item, "title", None), str)
+            and str(getattr(item, "title", "")).startswith("[Created] ")
+        ]
+        if created_items:
+            display_items = created_items
+
+    lines = ["Google Calendar updated."] if has_created else ["Upcoming Google Calendar events:"]
     sources: list[dict[str, str]] = []
-    for idx, item in enumerate(items[:8], start=1):
+    for idx, item in enumerate(display_items[:8], start=1):
         title = item.title
         item_url = (item.url or "").strip() or "https://calendar.google.com/"
         if title.startswith("[Created] "):
@@ -2001,6 +2125,22 @@ def _build_multi_step_plan(text: str) -> list[OrchestrationStep]:
     if len(requested_actions) < 2:
         return []
 
+    expected_outcomes: dict[str, str] = {}
+    if gmail_requested:
+        expected_outcomes["google_gmail"] = (
+            "gmail_send" if _looks_like_gmail_send_request(lowered) else "gmail_read"
+        )
+    if drive_requested:
+        expected_outcomes["google_drive"] = "drive_search"
+    if calendar_requested:
+        expected_outcomes["google_calendar"] = (
+            "calendar_write"
+            if _looks_like_calendar_write_request(lowered)
+            else "calendar_read"
+        )
+    if web_requested:
+        expected_outcomes["web_search"] = "web_search"
+
     ordered = ["google_gmail", "google_drive", "google_calendar", "web_search"]
     if gmail_requested and calendar_requested:
         calendar_pos = _first_keyword_position(
@@ -2022,16 +2162,73 @@ def _build_multi_step_plan(text: str) -> list[OrchestrationStep]:
     for action in ordered:
         if action not in requested_actions:
             continue
+        expected_outcome = expected_outcomes.get(action, "generic")
         steps.append(
             OrchestrationStep(
                 action=action,
-                query=_build_step_query(action=action, user_text=text),
+                query=_build_step_query(
+                    action=action,
+                    user_text=text,
+                    expected_outcome=expected_outcome,
+                ),
+                expected_outcome=expected_outcome,
             )
         )
     return steps
 
 
-def _build_step_query(action: str, user_text: str) -> str:
+def _looks_like_gmail_send_request(text: str) -> bool:
+    if not text:
+        return False
+    has_email_address = bool(
+        re.search(
+            r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    explicit_read_request = bool(
+        re.search(
+            r"\b(read|check|list|show|open)\b.*\b(email|gmail|inbox|thread|message)\b",
+            text,
+        )
+    )
+    if explicit_read_request and not has_email_address:
+        return False
+    if re.search(r"\b(confirm\s+send|send\s+draft|yes\s+send)\b", text):
+        return True
+    if has_email_address and re.search(r"\b(send|sned|snd|email|compose|write|tell)\b", text):
+        return True
+    return bool(
+        re.search(
+            r"\bemail\s+(?:to\s+)?[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_calendar_write_request(text: str) -> bool:
+    if not text:
+        return False
+    if re.search(r"\badd\s+it\s+to\s+my\s+calendar\b", text):
+        return True
+    has_write_verb = bool(
+        re.search(
+            r"\b(add|ad|create|schedule|book|set up|put|reschedule|move|shift|update|change|remind)\b",
+            text,
+        )
+    )
+    has_calendar_or_event_ref = bool(
+        re.search(r"\b(calendar|meeting|event|appointment|call|reminder)\b", text)
+    )
+    has_calendar_pronoun = bool(
+        "calendar" in text and re.search(r"\b(it|this|that)\b", text)
+    )
+    return has_write_verb and (has_calendar_or_event_ref or has_calendar_pronoun)
+
+
+def _build_step_query(action: str, user_text: str, expected_outcome: str) -> str:
     lowered = re.sub(r"\s+", " ", (user_text or "").strip().lower())
     if action == "google_gmail":
         email_match = re.search(
@@ -2039,7 +2236,9 @@ def _build_step_query(action: str, user_text: str) -> str:
             lowered,
             flags=re.IGNORECASE,
         )
-        if email_match and re.search(r"\b(confirm|confirmation|confirming)\b", lowered):
+        if expected_outcome == "gmail_send" and email_match and re.search(
+            r"\b(confirm|confirmation|confirming)\b", lowered
+        ):
             to_addr = email_match.group(1).strip()
             calendar_fields = _extract_calendar_fields(user_text)
             when_parts: list[str] = []
@@ -2053,6 +2252,10 @@ def _build_step_query(action: str, user_text: str) -> str:
             return (
                 f'send an email to {to_addr} say "Confirming our meeting for {when_text}."'
             )
+        if expected_outcome == "gmail_send":
+            if re.search(r"\b(send|sned|snd|email|compose|write|tell)\b", lowered):
+                return user_text.strip()
+            return f"send an email based on this request: {user_text.strip()}"
         if re.search(r"\bwhat does\b.*\bemail\b.*\b(say|says)\b", lowered):
             return user_text.strip()
         if re.search(r"\btell me\b.*\bemail\b.*\b(say|says)\b", lowered):
@@ -2067,12 +2270,109 @@ def _build_step_query(action: str, user_text: str) -> str:
             return f"find the most relevant Google Drive file for this request: {user_text.strip()}"
         return "find relevant files in Google Drive"
     if action == "google_calendar":
+        if expected_outcome == "calendar_write":
+            cleaned = _build_calendar_write_step_query(user_text)
+            if cleaned:
+                return cleaned
+            return user_text.strip()
         if re.search(r"\b(create|schedule|meeting|event|reschedule|move|time|availability)\b", lowered):
             return f"schedule or update a calendar event based on this request: {user_text.strip()}"
         if "remind" in lowered:
             return f"add a reminder event based on this request: {user_text.strip()}"
         return "check my calendar and propose times"
     return user_text.strip()
+
+
+def _build_calendar_write_step_query(user_text: str) -> str:
+    fields = _extract_calendar_fields(user_text)
+    parts: list[str] = ["add event"]
+    title = str(fields.get("title") or "").strip()
+    day = str(fields.get("day") or "").strip()
+    time_value = str(fields.get("time") or "").strip()
+    location = str(fields.get("location") or "").strip()
+    if title:
+        parts.append(title)
+    if day:
+        parts.append(f"on {day}")
+    if time_value:
+        parts.append(f"at {time_value}")
+    if location:
+        parts.append(f"in {location}")
+    if len(parts) == 1:
+        return ""
+    return " ".join(parts)
+
+
+def _is_gmail_drafted_items(items: list) -> bool:
+    for item in items:
+        title = str(getattr(item, "title", "")).strip().lower()
+        if title.startswith("[drafted]"):
+            return True
+    return False
+
+
+def _evaluate_calendar_step_execution(
+    expected_outcome: str, items: list
+) -> tuple[str, str]:
+    if expected_outcome == "calendar_write":
+        if _is_calendar_created_items(items):
+            return ("completed", "calendar_write_completed")
+        if _is_calendar_confirmation_required_items(items):
+            return ("action_required", "calendar_write_confirmation_required")
+        return ("failed", "calendar_write_not_executed")
+    if _is_calendar_confirmation_required_items(items):
+        return ("action_required", "calendar_confirmation_required")
+    return ("completed", "ok")
+
+
+def _evaluate_gmail_step_execution(
+    expected_outcome: str, items: list
+) -> tuple[str, str]:
+    if expected_outcome == "gmail_send":
+        if _is_gmail_sent_items(items):
+            return ("completed", "gmail_send_completed")
+        if _is_gmail_send_confirmation_required_items(items):
+            return ("action_required", "gmail_send_confirmation_required")
+        if _is_gmail_drafted_items(items):
+            return ("action_required", "gmail_draft_created_not_sent")
+        return ("failed", "gmail_send_not_executed")
+    if _is_gmail_send_confirmation_required_items(items):
+        return ("action_required", "gmail_send_confirmation_required")
+    return ("completed", "ok")
+
+
+def _annotate_orchestration_step_text(
+    action: str,
+    expected_outcome: str,
+    execution_status: str,
+    assistant_text: str,
+) -> str:
+    base_text = (assistant_text or "").strip()
+    prefix = ""
+    if execution_status == "action_required":
+        if action == "google_gmail" and expected_outcome == "gmail_send":
+            prefix = (
+                "Action required: Gmail needs confirmation before sending. "
+                "No email has been sent yet."
+            )
+        elif action == "google_calendar" and expected_outcome == "calendar_write":
+            prefix = (
+                "Action required: Google Calendar needs confirmation before creating this event. "
+                "No event has been added yet."
+            )
+        else:
+            prefix = "Action required before this step can be fully completed."
+    elif execution_status == "failed":
+        if action == "google_gmail" and expected_outcome == "gmail_send":
+            prefix = "This step did not send the requested email."
+        elif action == "google_calendar" and expected_outcome == "calendar_write":
+            prefix = "This step did not create the requested calendar event."
+
+    if not prefix:
+        return base_text
+    if not base_text:
+        return prefix
+    return f"{prefix}\n\n{base_text}"
 
 
 def _first_keyword_position(text: str, patterns: list[str]) -> int:
@@ -2086,21 +2386,64 @@ def _first_keyword_position(text: str, patterns: list[str]) -> int:
     return min(found_positions)
 
 
+def _step_execution_status(step: OrchestrationStepResult) -> str:
+    raw = (step.execution_status or "").strip().lower()
+    if raw in {"completed", "action_required", "failed"}:
+        return raw
+    return "completed" if step.success else "failed"
+
+
+def _orchestration_status_label(status: str) -> str:
+    if status == "completed":
+        return "Completed"
+    if status == "action_required":
+        return "Action Required"
+    return "Failed"
+
+
 def _format_orchestration_response(step_results: list[OrchestrationStepResult]) -> str:
     if not step_results:
         return "No orchestration steps were executed."
-    completed = sum(1 for step in step_results if step.success)
+    completed = sum(1 for step in step_results if _step_execution_status(step) == "completed")
+    action_required = sum(
+        1 for step in step_results if _step_execution_status(step) == "action_required"
+    )
+    failed = sum(1 for step in step_results if _step_execution_status(step) == "failed")
     total = len(step_results)
     lines = [
         "Orchestration Summary",
         "---------------------",
-        f"Executed {total} step(s). Completed: {completed}.",
-        "",
-        "Step Results",
-        "------------",
+        (
+            f"Executed {total} step(s). Completed: {completed}. "
+            f"Action required: {action_required}. Failed: {failed}."
+        ),
     ]
+    if action_required > 0:
+        pending_lines = [
+            _pending_task_label(step)
+            for step in step_results
+            if _step_execution_status(step) == "action_required"
+        ]
+        lines.extend(
+            [
+                "Pending tasks:",
+                *[f"- {pending}" for pending in pending_lines],
+                "Reply with 'confirm' to execute all pending tasks.",
+                "Reply with 'cancel' to stop all pending tasks.",
+                "Or tell me what to change.",
+                "",
+            ]
+        )
+    else:
+        lines.append("")
+    lines.extend(
+        [
+            "Step Results",
+            "------------",
+        ]
+    )
     for index, step in enumerate(step_results, start=1):
-        status = "Completed" if step.success else "Failed"
+        status = _orchestration_status_label(_step_execution_status(step))
         lines.append(f"{index}. {step.capability_label}: {status}")
         lines.append(f"   Query: {step.query}")
         first_line = (step.assistant_text or "").strip().splitlines()
@@ -2126,6 +2469,21 @@ def _dedupe_sources_by_url(sources: list[dict[str, str]]) -> list[dict[str, str]
     return out
 
 
+def _pending_task_label(step: OrchestrationStepResult) -> str:
+    reason = (step.reason or "").strip().lower()
+    if step.action == "google_gmail":
+        if reason in {"gmail_send_confirmation_required", "gmail_draft_created_not_sent"}:
+            return "Email pending confirmation (Gmail)"
+        return "Gmail action pending confirmation"
+    if step.action == "google_calendar":
+        if reason in {"calendar_write_confirmation_required", "calendar_confirmation_required"}:
+            return "Calendar event pending confirmation (Google Calendar)"
+        return "Google Calendar action pending confirmation"
+    if step.action == "google_drive":
+        return "Google Drive action pending confirmation"
+    return f"{step.capability_label} action pending confirmation"
+
+
 def _serialize_orchestration_step_result(step: OrchestrationStepResult) -> dict[str, object]:
     return {
         "action": step.action,
@@ -2133,6 +2491,7 @@ def _serialize_orchestration_step_result(step: OrchestrationStepResult) -> dict[
         "query": step.query,
         "success": step.success,
         "reason": step.reason,
+        "execution_status": _step_execution_status(step),
         "capability_label": step.capability_label,
         "source_count": len(step.sources),
     }
@@ -2403,6 +2762,25 @@ def _is_gmail_send_confirmation_reply(text: str) -> bool:
         or "yes send draft" in lowered
         or re.match(r"^\s*(yes|ok|okay|go ahead|proceed)\b", lowered)
     )
+
+
+def _is_gmail_pending_status_followup(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    if _is_gmail_send_confirmation_reply(text) or _is_gmail_cancel_reply(text):
+        return False
+    if re.search(r"\bwhat\s+about\b.*\b(email|gmail|send)\b", lowered):
+        return True
+    if re.search(r"\b(?:did|have)\s+you\s+(?:send|email)\b", lowered):
+        return True
+    if re.search(r"\b(email|gmail)\b.*\b(?:status|pending|sent)\b", lowered):
+        return True
+    if re.search(r"\b(send|email)\s+it\b", lowered):
+        return True
+    if re.search(r"\bwhy\b.*\b(events|calendar)\b", lowered):
+        return True
+    return False
 
 
 def _is_meta_web_search_request(text: str) -> bool:

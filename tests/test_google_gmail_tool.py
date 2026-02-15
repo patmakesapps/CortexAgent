@@ -279,6 +279,38 @@ class GoogleGmailToolTests(unittest.TestCase):
         self.assertEqual(result.items[0].title, "Send confirmation required")
         confirmation_mock.assert_called_once()
 
+    def test_extract_new_email_fields_handles_tell_them_and_trims_calendar_followup(self):
+        to_addr, subject, body = _extract_new_email_fields(
+            "email purpleparkstudios@gmail.com and tell them I will be able to do the video "
+            "for $4,000 on April 2nd at 6pm please add it to my calendar as well"
+        )
+        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertTrue(subject)
+        self.assertIn("I will be able to do the video for $4,000 on April 2nd at 6pm", body)
+        self.assertNotIn("add it to my calendar", body.lower())
+
+    def test_extract_new_email_fields_uses_llm_composer_for_compose_body_prompt(self):
+        with patch(
+            "cortexagent.tools.google_gmail._llm_compose_email_fields",
+            return_value=(
+                "purpleparkstudios@gmail.com",
+                "Meeting agenda",
+                "Hi Rob, I am available to film the video for $4,000. Thanks.",
+            ),
+        ) as llm_mock:
+            to_addr, subject, body = _extract_new_email_fields(
+                "send an email to purpleparkstudios@gmail.com and in the email make the subject "
+                "\"Meeting agenda\" then compose the body stating i am available to film the video "
+                "for $4,000. Then add to my calendar meeting with Rob."
+            )
+
+        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertEqual(subject, "Meeting agenda")
+        self.assertEqual(
+            body, "Hi Rob, I am available to film the video for $4,000. Thanks"
+        )
+        llm_mock.assert_called_once()
+
     def test_send_message_uses_gmail_drafts_send_endpoint(self):
         tool = GoogleGmailTool()
         with patch.object(
@@ -299,9 +331,9 @@ class GoogleGmailToolTests(unittest.TestCase):
                 allowed_domains=set(),
             )
 
-        self.assertEqual(result.title, "[Sent] Draft r-1")
+        self.assertEqual(result.title, "[Sent] Email")
         self.assertEqual(result.url, "https://mail.google.com/mail/u/0/#inbox/thread-1")
-        self.assertEqual(result.snippet, "Message id: msg-1 | To: me@example.com")
+        self.assertEqual(result.snippet, "To: me@example.com")
         self.assertEqual(api_mock.call_count, 1)
         self.assertEqual(
             api_mock.call_args.kwargs.get("url"),

@@ -192,6 +192,26 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
         quick_add_mock.assert_called_once()
         list_mock.assert_called_once()
 
+    def test_confirm_word_inside_sentence_does_not_auto_confirm_write(self):
+        tool = GoogleCalendarTool()
+        with patch.object(tool, "_quick_add_event") as quick_add_mock, patch.object(
+            tool, "_list_upcoming_events"
+        ) as list_mock:
+            result = tool.run(
+                ToolContext(
+                    thread_id="thread-1",
+                    user_text=(
+                        "send an email to purpleparkstudios@gmail.com and confirm the meeting "
+                        "at 6pm on monday. add it to my calendar"
+                    ),
+                    tool_meta={"access_token": "token-1"},
+                )
+            )
+
+        self.assertEqual(result.items[0].title, "Confirmation required")
+        quick_add_mock.assert_not_called()
+        list_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
