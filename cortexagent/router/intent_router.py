@@ -25,6 +25,11 @@ EXPLICIT_WEB_INTENT_TERMS = (
 TIME_SENSITIVE_FACT_TERMS = (
     "latest",
     "today",
+    "right now",
+    "current",
+    "live",
+    "market",
+    "market now",
     "news",
     "price",
     "stock",
@@ -130,6 +135,10 @@ def _keyword_decision(user_text: str) -> RouteDecision:
 
 
 def _looks_like_time_sensitive_fact_request(text: str) -> bool:
+    if not text:
+        return False
+    if _looks_like_live_market_prompt(text):
+        return True
     question_like = (
         "?" in text
         or text.startswith(("what", "who", "when", "where", "how", "is", "are", "does", "do", "did", "can"))
@@ -138,6 +147,19 @@ def _looks_like_time_sensitive_fact_request(text: str) -> bool:
     if not question_like:
         return False
     return any(term in text for term in TIME_SENSITIVE_FACT_TERMS)
+
+
+def _looks_like_live_market_prompt(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    if not normalized:
+        return False
+    has_market_subject = bool(
+        re.search(r"\b(bitcoin|btc|ethereum|eth|crypto|stock|sp500|nasdaq|dow)\b", normalized)
+    )
+    has_live_cue = bool(
+        re.search(r"\b(live|current|right now|market|price|quote|trading at|doing on the market)\b", normalized)
+    )
+    return has_market_subject and has_live_cue
 
 
 def _matches_explicit_calendar_write_intent(text: str) -> bool:

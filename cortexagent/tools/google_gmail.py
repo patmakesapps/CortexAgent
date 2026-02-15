@@ -603,6 +603,11 @@ def _extract_new_email_fields(text: str) -> tuple[str, str, str]:
     if not subject:
         subject = _infer_subject_text(cleaned, body)
     subject = _normalize_extracted_field(subject, max_len=300) or "Quick note"
+    if _looks_like_ambiguous_new_email_parse(body=body, subject=subject):
+        raise RuntimeError(
+            "I couldn’t confidently parse the email body. "
+            "Please provide it as: say \"...\" (and optional subject \"...\")."
+        )
     return to_addr, subject, body
 
 
@@ -805,6 +810,24 @@ def _looks_like_non_body_fragment(value: str, known_subject: str) -> bool:
     }:
         return True
     return False
+
+
+def _looks_like_ambiguous_new_email_parse(body: str, subject: str) -> bool:
+    normalized_body = _normalize_extracted_field(body, max_len=5000).lower()
+    normalized_subject = _normalize_extracted_field(subject, max_len=300).lower()
+    if not normalized_body:
+        return True
+    if normalized_body == normalized_subject and len(normalized_body.split()) <= 2:
+        return True
+    parser_residue = (
+        normalized_body.startswith("subject ")
+        or normalized_body.startswith("body ")
+        or normalized_body.startswith("message ")
+        or normalized_body in {"send", "email", "gmail", "draft"}
+    )
+    if parser_residue:
+        return True
+    return len(normalized_body) < 2
 
 
 def _normalize_quote_chars(text: str) -> str:

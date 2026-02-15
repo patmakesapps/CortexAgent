@@ -200,6 +200,10 @@ class GoogleGmailToolTests(unittest.TestCase):
         self.assertEqual(subject, "hello this is a test note")
         self.assertEqual(body, "hello this is a test note")
 
+    def test_extract_new_email_fields_rejects_ambiguous_short_body(self):
+        with self.assertRaises(RuntimeError):
+            _extract_new_email_fields("send an email to purpleparkstudios@gmail.com say s")
+
     def test_send_intent_accepts_sned_typo(self):
         self.assertTrue(
             _is_send_new_email_intent("sned an email to purpleparkstudios@gmail.com hey")

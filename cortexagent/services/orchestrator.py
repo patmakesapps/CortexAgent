@@ -153,7 +153,7 @@ class AgentOrchestrator:
                 sources=[],
                 profile=verification,
             )
-            assistant_text = _prevent_unexecuted_calendar_write_claims(
+            assistant_text = _prevent_unexecuted_action_claims(
                 assistant_text=assistant_text,
                 routed_action=route.action,
             )
@@ -1235,6 +1235,9 @@ def _source_rank_for_price(url: str) -> tuple[int, str]:
 def _looks_like_ad_source(title: str, url: str) -> bool:
     lowered_title = title.lower()
     lowered_url = url.lower()
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "/").lower()
     ad_markers = [
         "trusted",
         "sign up",
@@ -1242,7 +1245,18 @@ def _looks_like_ad_source(title: str, url: str) -> bool:
         "easy cryptocurrency trading",
         "advert",
     ]
+    generic_homepage_markers = [
+        "google",
+        "yandex",
+        "duckduckgo",
+        "bing",
+        "search",
+    ]
     if any(marker in lowered_title for marker in ad_markers):
+        return True
+    if path in {"", "/"} and any(marker in lowered_title for marker in generic_homepage_markers):
+        return True
+    if host in {"google.com", "www.google.com", "yandex.com", "www.yandex.com"} and path in {"", "/"}:
         return True
     if "duckduckgo.com/y.js" in lowered_url or "bing.com/aclick" in lowered_url:
         return True
@@ -1717,22 +1731,32 @@ def _extract_calendar_draft_text(items: list, fallback: str) -> str:
     return fallback
 
 
-def _prevent_unexecuted_calendar_write_claims(assistant_text: str, routed_action: str) -> str:
-    if routed_action == "google_calendar":
+def _prevent_unexecuted_action_claims(assistant_text: str, routed_action: str) -> str:
+    if routed_action in {"google_calendar", "google_gmail"}:
         return assistant_text
     lowered = (assistant_text or "").strip().lower()
     if not lowered:
         return assistant_text
-    mentions_calendar = "calendar" in lowered
-    claims_write = bool(
+    calendar_claim = "calendar" in lowered and bool(
         re.search(
             r"\b(i(?:'ve| have)?\s+(added|scheduled|booked|put)|it(?:'s| is)\s+added|added your)\b",
             lowered,
         )
     )
-    if mentions_calendar and claims_write:
+    gmail_claim = bool(
+        re.search(
+            r"\b(i(?:'ve| have)?\s+(sent|emailed)|email sent|sent successfully|i did send)\b",
+            lowered,
+        )
+    )
+    if calendar_claim:
         return (
             "I haven’t added anything to your Google Calendar yet. "
             "I can do that through the calendar tool now if you want."
+        )
+    if gmail_claim:
+        return (
+            "I haven’t sent an email yet. "
+            "I can draft it and send only after your confirmation."
         )
     return assistant_text

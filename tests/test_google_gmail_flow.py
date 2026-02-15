@@ -107,6 +107,14 @@ def _active_account() -> ConnectedAccount:
 
 
 class GoogleGmailFlowTests(unittest.TestCase):
+    def test_router_picks_web_search_for_live_eth_market_prompt(self):
+        result = decide_action(
+            user_text="how is ethereum doing on the market right now",
+            tools_enabled=True,
+            web_search_enabled=True,
+        )
+        self.assertEqual(result.action, "web_search")
+
     def test_router_picks_google_gmail(self):
         result = decide_action(
             user_text="List my recent gmail threads",

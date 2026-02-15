@@ -6,7 +6,11 @@ from unittest.mock import patch
 from cortexagent.router.intent_router import decide_action
 from cortexagent.services.connected_accounts_repo import ConnectedAccount, ResolvedProviderToken
 from cortexagent.services.google_oauth import GoogleTokenExchange
-from cortexagent.services.orchestrator import AgentOrchestrator, _build_confirmed_calendar_request
+from cortexagent.services.orchestrator import (
+    AgentOrchestrator,
+    _build_confirmed_calendar_request,
+    _looks_like_ad_source,
+)
 from cortexagent.tools.base import Tool, ToolContext, ToolResult, ToolResultItem
 from cortexagent.tools.registry import ToolRegistry
 
@@ -41,6 +45,17 @@ class _LyingLtmClient:
     def add_event(self, thread_id, actor, content, meta, authorization):
         _ = (thread_id, actor, content, meta, authorization)
         return "event-2"
+
+
+@dataclass
+class _LyingEmailLtmClient:
+    def chat(self, thread_id, text, short_term_limit, authorization):
+        _ = (thread_id, text, short_term_limit, authorization)
+        return "I did send the email and it was sent successfully."
+
+    def add_event(self, thread_id, actor, content, meta, authorization):
+        _ = (thread_id, actor, content, meta, authorization)
+        return "event-3"
 
 
 class _FakeGoogleCalendarTool(Tool):
@@ -789,6 +804,28 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         )
         self.assertNotIn("I've added your meeting to your calendar", result.response)
         self.assertIn("I haven’t added anything to your Google Calendar yet.", result.response)
+
+    def test_orchestrator_blocks_gmail_send_claims_without_gmail_tool(self):
+        registry = ToolRegistry()
+        registry.register(_FakeGoogleCalendarTool())
+        orchestrator = AgentOrchestrator(
+            ltm_client=_LyingEmailLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=None,  # type: ignore[arg-type]
+            google_oauth=None,  # type: ignore[arg-type]
+        )
+        result = orchestrator.handle_chat(
+            thread_id="thread-1",
+            text="did you actually send it?",
+            short_term_limit=30,
+            authorization=None,
+        )
+        self.assertNotIn("I did send the email", result.response)
+        self.assertIn("I haven’t sent an email yet.", result.response)
+
+    def test_source_filter_rejects_generic_search_homepages(self):
+        self.assertTrue(_looks_like_ad_source("Google: Search the world's information", "https://www.google.com/"))
+        self.assertTrue(_looks_like_ad_source("Yandex - fast Internet search", "https://yandex.com/"))
 
     def test_orchestrator_handles_calendar_day_correction_before_ok(self):
         account = _active_account()
