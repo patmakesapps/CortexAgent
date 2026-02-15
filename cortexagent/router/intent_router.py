@@ -17,6 +17,11 @@ EXPLICIT_WEB_INTENT_TERMS = (
     "find online",
     "show links",
     "send links",
+    "link me",
+    "link me to",
+    "can you link me",
+    "give me links",
+    "send me links",
     "show sources",
     "source links",
     "citations",
@@ -41,6 +46,11 @@ TIME_SENSITIVE_FACT_TERMS = (
     "version",
     "outage",
     "policy change",
+    "hotel",
+    "flight",
+    "airfare",
+    "fare",
+    "rate",
 )
 
 NON_WEB_TASK_TERMS = (
@@ -110,6 +120,24 @@ class RouteDecision:
 
 def _keyword_decision(user_text: str) -> RouteDecision:
     text = user_text.strip().lower()
+    if _looks_like_link_request_followup(text):
+        return RouteDecision(
+            action="web_search",
+            reason="matched_link_request_followup",
+            confidence=0.95,
+        )
+    if _looks_like_shopping_research_request(text):
+        return RouteDecision(
+            action="web_search",
+            reason="matched_shopping_research_request",
+            confidence=0.94,
+        )
+    if _looks_like_travel_price_request(text):
+        return RouteDecision(
+            action="web_search",
+            reason="matched_travel_price_request",
+            confidence=0.95,
+        )
     if _matches_explicit_calendar_write_intent(text):
         return RouteDecision(
             action="google_calendar",
@@ -174,6 +202,56 @@ def _looks_like_time_sensitive_fact_request(text: str) -> bool:
     return any(term in text for term in TIME_SENSITIVE_FACT_TERMS)
 
 
+def _looks_like_travel_price_request(text: str) -> bool:
+    if not text:
+        return False
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    has_price_signal = bool(
+        re.search(r"\b(price|prices|rate|rates|cost|costs|cheap|cheaper|best deal|deals)\b", normalized)
+    )
+    has_travel_entity = bool(
+        re.search(r"\b(hotel|hotels|flight|flights|airfare|air fare|lodging|stay)\b", normalized)
+    )
+    has_location_hint = bool(
+        re.search(r"\b(in|near|around|for)\s+[a-z]{2,}", normalized)
+        or " dc " in f" {normalized} "
+        or "washington dc" in normalized
+    )
+    return has_price_signal and has_travel_entity and has_location_hint
+
+
+def _looks_like_shopping_research_request(text: str) -> bool:
+    if not text:
+        return False
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    has_product_intent = bool(
+        re.search(
+            r"\b(buy|purchase|get|recommend|best|good|options|models|camera|laptop|phone|headphones|monitor|mic|microphone)\b",
+            normalized,
+        )
+    )
+    has_price_or_budget = bool(
+        re.search(r"\b(price|prices|budget|\$\s*\d+|\d{3,5}\s*(usd|dollars)?)\b", normalized)
+    )
+    asks_for_external_choices = bool(
+        re.search(r"\b(link|links|compare|reviews?|in my price range|for my budget|under \$?\d+)\b", normalized)
+    )
+    return has_product_intent and (has_price_or_budget or asks_for_external_choices)
+
+
+def _looks_like_link_request_followup(text: str) -> bool:
+    if not text:
+        return False
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    return bool(
+        re.search(
+            r"\b(can you|could you|please)?\s*(link me|send me links|give me links|show links)\b",
+            normalized,
+        )
+        or re.search(r"\b(link(s)? to (a few|some|options|models))\b", normalized)
+    )
+
+
 def _looks_like_live_market_prompt(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text.strip().lower())
     if not normalized:
@@ -235,7 +313,11 @@ def _extract_json(content: str) -> dict[str, object]:
     return value
 
 
-def _llm_decision(user_text: str) -> RouteDecision | None:
+def _llm_decision(
+    user_text: str,
+    prior_user_text: str | None = None,
+    prior_tool_action: str | None = None,
+) -> RouteDecision | None:
     if not settings.router_llm_enabled:
         return None
     if not settings.groq_api_key:
@@ -243,23 +325,22 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
 
     prompt = (
         "You are a routing classifier for a chat agent.\n"
-        "Choose one action for the user request:\n"
-        "- web_search: requires current/external/verifiable web data\n"
-        "- google_calendar: user asks about their own schedule/events/calendar\n"
-        "- google_drive: user asks about their own files/docs/folders in Google Drive\n"
-        "- google_gmail: user asks about their own inbox/threads/messages/drafts\n"
-        "- chat: answer directly from internal reasoning/knowledge\n\n"
+        "Available tools:\n"
+        "- web_search: use for current external facts, product links/options, prices, comparisons, news\n"
+        "- google_calendar: use for user's schedule/events and calendar write actions\n"
+        "- google_drive: use for user's files/docs/folders\n"
+        "- google_gmail: use for user's inbox/threads/messages/drafts/send flows\n"
+        "- chat: use when no external or personal-tool data is needed\n\n"
+        "Task:\n"
+        "Choose exactly one action for this turn based on user intent and recent context.\n\n"
         "Rules:\n"
-        "- Prefer web_search for time-sensitive facts (news, prices, weather, sports, schedules, releases, laws, policies, outages, version changes).\n"
-        "- Prefer web_search when stale information could cause a wrong answer.\n"
-        "- Prefer chat for timeless concepts, creative writing, coding help, editing, translation, and personal advice.\n"
-        "- Keywords are hints, not the source of truth.\n"
-        "- If user clearly refers to their personal calendar/events/schedule, prefer google_calendar.\n"
-        "- If user clearly refers to their personal drive files/docs/folders, prefer google_drive.\n"
-        "- If user clearly refers to their inbox/emails/threads/drafts, prefer google_gmail.\n"
+        "- Prefer web_search for requests requiring links, options, prices, current facts, or comparisons.\n"
+        "- Prefer web_search for follow-ups like 'show me more options', 'link me a few', when prior topic needs external data.\n"
+        "- Prefer chat for timeless conceptual guidance when no retrieval is required.\n"
+        "- Prefer google_* tools only when user intent is clearly about personal connected data.\n"
         "- Return strict JSON only.\n\n"
         "Output schema:\n"
-        '{"action":"web_search|google_calendar|google_drive|google_gmail|chat","reason":"short_reason","confidence":0.0}'
+        '{"action":"web_search|google_calendar|google_drive|google_gmail|chat","reason":"short_reason","confidence":0.0,"needs_external_data":true}'
     )
 
     payload = {
@@ -269,7 +350,14 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": user_text.strip()},
+            {
+                "role": "user",
+                "content": (
+                    f"Current user message:\n{user_text.strip()}\n\n"
+                    f"Prior user message (if any):\n{(prior_user_text or '').strip() or 'none'}\n\n"
+                    f"Prior routed tool action (if any):\n{(prior_tool_action or '').strip() or 'none'}"
+                ),
+            },
         ],
     }
     body = json.dumps(payload).encode("utf-8")
@@ -300,11 +388,17 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
         action = str(data.get("action", "")).strip().lower()
         reason = str(data.get("reason", "")).strip() or "llm_router"
         confidence = float(data.get("confidence", 0.7))
+        needs_external_data = bool(data.get("needs_external_data", False))
     except Exception:
         return None
 
     if action not in {"chat", "web_search", "google_calendar", "google_drive", "google_gmail"}:
         return None
+    if needs_external_data and action == "chat":
+        # Keep outputs deterministic: if model says external data is needed, route web_search.
+        action = "web_search"
+        reason = f"{reason}|external_data_required"
+        confidence = max(confidence, 0.8)
     if confidence < 0.0:
         confidence = 0.0
     if confidence > 1.0:
@@ -312,7 +406,48 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
     return RouteDecision(action=action, reason=f"llm:{reason}", confidence=confidence)
 
 
-def decide_action(user_text: str, tools_enabled: bool, web_search_enabled: bool) -> RouteDecision:
+def _apply_route_policy(
+    route: RouteDecision,
+    user_text: str,
+    prior_user_text: str | None,
+    prior_tool_action: str | None,
+    web_search_enabled: bool,
+) -> RouteDecision:
+    text = user_text.strip().lower()
+    prior_text = (prior_user_text or "").strip().lower()
+    if not web_search_enabled:
+        return route
+
+    # Deterministic safety net: product-shopping follow-ups should not silently stay in chat.
+    if route.action == "chat":
+        if _looks_like_shopping_research_request(text):
+            return RouteDecision(
+                action="web_search",
+                reason="policy_override_shopping_research",
+                confidence=max(route.confidence, 0.9),
+            )
+        if _looks_like_link_request_followup(text) and _looks_like_shopping_research_request(prior_text):
+            return RouteDecision(
+                action="web_search",
+                reason="policy_override_link_followup",
+                confidence=max(route.confidence, 0.92),
+            )
+        if prior_tool_action == "web_search" and _looks_like_link_request_followup(text):
+            return RouteDecision(
+                action="web_search",
+                reason="policy_override_continue_web_search",
+                confidence=max(route.confidence, 0.9),
+            )
+    return route
+
+
+def decide_action(
+    user_text: str,
+    tools_enabled: bool,
+    web_search_enabled: bool,
+    prior_user_text: str | None = None,
+    prior_tool_action: str | None = None,
+) -> RouteDecision:
     text = user_text.strip().lower()
     if not text:
         return RouteDecision(action="chat", reason="empty_text", confidence=1.0)
@@ -340,9 +475,26 @@ def decide_action(user_text: str, tools_enabled: bool, web_search_enabled: bool)
         )
 
     if web_search_enabled:
-        llm_route = _llm_decision(user_text)
+        llm_route = _llm_decision(
+            user_text=user_text,
+            prior_user_text=prior_user_text,
+            prior_tool_action=prior_tool_action,
+        )
         if llm_route is not None:
-            return llm_route
-        return _keyword_decision(user_text)
+            return _apply_route_policy(
+                llm_route,
+                user_text=user_text,
+                prior_user_text=prior_user_text,
+                prior_tool_action=prior_tool_action,
+                web_search_enabled=web_search_enabled,
+            )
+        keyword_route = _keyword_decision(user_text)
+        return _apply_route_policy(
+            keyword_route,
+            user_text=user_text,
+            prior_user_text=prior_user_text,
+            prior_tool_action=prior_tool_action,
+            web_search_enabled=web_search_enabled,
+        )
 
     return RouteDecision(action="chat", reason="default_chat", confidence=0.75)

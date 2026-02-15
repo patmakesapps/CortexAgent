@@ -44,6 +44,8 @@ class AgentOrchestrator:
         self._pending_calendar_drafts: dict[str, str] = {}
         self._pending_gmail_send_requests: dict[str, str] = {}
         self._last_tool_action_by_thread: dict[str, str] = {}
+        self._last_non_meta_user_text_by_thread: dict[str, str] = {}
+        self._last_web_search_query_by_thread: dict[str, str] = {}
 
     def handle_chat(
         self,
@@ -52,6 +54,11 @@ class AgentOrchestrator:
         short_term_limit: int | None,
         authorization: str | None,
     ) -> OrchestratorResult:
+        previous_non_meta_user_text = self._last_non_meta_user_text_by_thread.get(thread_id)
+        is_meta_web_request = _is_meta_web_search_request(text)
+        if not is_meta_web_request:
+            self._last_non_meta_user_text_by_thread[thread_id] = text
+
         pending_calendar_draft = self._pending_calendar_drafts.get(thread_id)
         pending_gmail_send = self._pending_gmail_send_requests.get(thread_id)
         if pending_calendar_draft and _is_calendar_cancel_reply(text):
@@ -62,6 +69,20 @@ class AgentOrchestrator:
                 decision=AgentDecision(
                     action="google_calendar",
                     reason="calendar_draft_canceled",
+                    confidence=1.0,
+                ),
+                sources=[],
+            )
+        if pending_calendar_draft and _is_calendar_pause_reply(text):
+            response = (
+                "Understood. I will hold this calendar draft for now. "
+                "Reply with 'confirm' when you want me to add it."
+            )
+            return OrchestratorResult(
+                response=response,
+                decision=AgentDecision(
+                    action="google_calendar",
+                    reason="calendar_draft_paused",
                     confidence=1.0,
                 ),
                 sources=[],
@@ -98,12 +119,16 @@ class AgentOrchestrator:
             )
 
         verification = assess_verification_profile(text)
-        if pending_calendar_draft and (
-            _is_calendar_confirmation_reply(text) or _is_calendar_draft_edit_reply(text)
-        ):
+        if pending_calendar_draft and _is_calendar_draft_edit_reply(text):
             route = RouteDecision(
                 action="google_calendar",
                 reason="calendar_confirmation_followup",
+                confidence=0.99,
+            )
+        elif pending_calendar_draft:
+            route = RouteDecision(
+                action="google_calendar",
+                reason="calendar_pending_default_confirm",
                 confidence=0.99,
             )
         elif pending_gmail_send and _is_gmail_send_confirmation_reply(text):
@@ -112,11 +137,25 @@ class AgentOrchestrator:
                 reason="gmail_send_confirmation_followup",
                 confidence=0.99,
             )
+        elif (
+            (_is_generic_web_followup_request(text) or is_meta_web_request)
+            and (
+                self._last_web_search_query_by_thread.get(thread_id)
+                or previous_non_meta_user_text
+            )
+        ):
+            route = RouteDecision(
+                action="web_search",
+                reason="web_search_followup",
+                confidence=0.99,
+            )
         else:
             route = decide_action(
                 user_text=text,
                 tools_enabled=settings.agent_tools_enabled,
                 web_search_enabled=settings.web_search_enabled,
+                prior_user_text=previous_non_meta_user_text,
+                prior_tool_action=self._last_tool_action_by_thread.get(thread_id),
             )
             if route.action == "chat":
                 sticky_route = _maybe_continue_recent_tool_route(
@@ -147,6 +186,7 @@ class AgentOrchestrator:
                 short_term_limit=short_term_limit,
                 authorization=authorization,
             )
+            assistant_text = _polish_response_text(assistant_text)
             assistant_text = enforce_verification_policy(
                 user_text=text,
                 assistant_text=assistant_text,
@@ -170,7 +210,7 @@ class AgentOrchestrator:
         if route.action == "google_calendar":
             tool = self.tool_registry.get("google_calendar")
             effective_calendar_text = text
-            if pending_calendar_draft and _is_calendar_confirmation_reply(text):
+            if pending_calendar_draft and not _is_calendar_draft_edit_reply(text):
                 effective_calendar_text = _build_confirmed_calendar_request(
                     draft_text=pending_calendar_draft,
                     followup_text=text,
@@ -244,6 +284,7 @@ class AgentOrchestrator:
                 )
 
             assistant_text, sources = _format_google_calendar_response(result.items)
+            assistant_text = _polish_response_text(assistant_text)
             if _is_calendar_confirmation_required_items(result.items):
                 self._pending_calendar_drafts[thread_id] = _extract_calendar_draft_text(
                     items=result.items,
@@ -352,6 +393,7 @@ class AgentOrchestrator:
                 )
 
             assistant_text, sources = _format_google_gmail_response(result.items)
+            assistant_text = _polish_response_text(assistant_text)
             if _is_gmail_send_confirmation_required_items(result.items):
                 self._pending_gmail_send_requests[thread_id] = _extract_gmail_send_pending_text(
                     items=result.items,
@@ -447,6 +489,7 @@ class AgentOrchestrator:
                 )
 
             assistant_text, sources = _format_google_drive_response(result.items)
+            assistant_text = _polish_response_text(assistant_text)
             self._persist_tool_events(
                 thread_id=thread_id,
                 user_text=text,
@@ -470,8 +513,25 @@ class AgentOrchestrator:
             )
 
         tool = self.tool_registry.get("web_search")
+        last_web_query = self._last_web_search_query_by_thread.get(thread_id)
+        if (_is_generic_web_followup_request(text) or _is_link_followup_request(text)) and last_web_query:
+            web_search_text = _build_followup_web_query(
+                followup_text=text,
+                previous_query=last_web_query,
+            )
+        elif _is_link_followup_request(text) and previous_non_meta_user_text:
+            web_search_text = _build_followup_web_query(
+                followup_text=text,
+                previous_query=previous_non_meta_user_text,
+            )
+        elif is_meta_web_request and last_web_query:
+            web_search_text = last_web_query
+        elif is_meta_web_request and previous_non_meta_user_text:
+            web_search_text = previous_non_meta_user_text
+        else:
+            web_search_text = text
         try:
-            result = tool.run(ToolContext(thread_id=thread_id, user_text=text))
+            result = tool.run(ToolContext(thread_id=thread_id, user_text=web_search_text))
         except Exception as exc:
             assistant_text = (
                 "I routed this request to web search, but the search providers failed. "
@@ -481,7 +541,7 @@ class AgentOrchestrator:
                 thread_id=thread_id,
                 user_text=text,
                 assistant_text=assistant_text,
-                query=text,
+                query=web_search_text,
                 authorization=authorization,
                 decision_action="web_search",
                 tool_name="web_search",
@@ -498,6 +558,7 @@ class AgentOrchestrator:
             )
 
         assistant_text, sources = _format_web_search_response(result.items, text)
+        assistant_text = _polish_response_text(assistant_text)
         assistant_text = _verify_numeric_claims(
             user_text=text,
             assistant_text=assistant_text,
@@ -514,12 +575,13 @@ class AgentOrchestrator:
             user_text=text,
             assistant_text=assistant_text,
             tool_name=result.tool_name,
-            query=result.query,
+            query=web_search_text,
             sources=sources,
             authorization=authorization,
             decision_action=route.action,
             capability_label="Web Search",
         )
+        self._last_web_search_query_by_thread[thread_id] = web_search_text
 
         return OrchestratorResult(
             response=assistant_text,
@@ -762,20 +824,37 @@ def _format_web_search_response(
                 f"As of {timestamp}, I could not extract a stable live {subject} price "
                 "from the available snippets."
             )
-        lines = [headline, "Sources:"]
+        lines = [
+            "Live Price Snapshot",
+            "-------------------",
+            headline,
+            "",
+            "Source Links",
+            "------------",
+        ]
         if spot_source:
-            lines.append(f"- CoinGecko spot quote: {spot_source}")
+            lines.append(f"- CoinGecko spot quote | {spot_source}")
             list_limit = 2
     else:
-        lines = ["Here is what I found from web sources:"]
+        lines = [
+            "Web Results",
+            "-----------",
+            f"Checked {len(sources)} sources at {timestamp}.",
+            "",
+            "Top Matches",
+            "-----------",
+        ]
         for idx, src in enumerate(sources, start=1):
             snippet = src.get("snippet", "")
             title = src.get("title", "")
-            lines.append(f"{idx}. {title}: {snippet}")
-        lines.append("Sources:")
+            lines.append(f"{idx}. {title}")
+            if snippet:
+                lines.append(f"   {snippet}")
+            lines.append("")
+        lines.extend(["Source Links", "------------"])
 
     for src in sources[:list_limit]:
-        lines.append(f"- {src['title']}: {src['url']}")
+        lines.append(f"- {src['title']} | {src['url']}")
 
     return "\n".join(lines), sources
 
@@ -1044,7 +1123,6 @@ def _humanize_calendar_time_label(label: str) -> str:
 
 
 PRICE_QUERY_TOKENS = {
-    "price",
     "live price",
     "current price",
     "quote",
@@ -1095,7 +1173,52 @@ def _verify_numeric_claims(
 
 def _looks_like_live_price_query(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text.strip().lower())
-    return any(token in normalized for token in PRICE_QUERY_TOKENS)
+    if not normalized:
+        return False
+    has_price_phrase = any(token in normalized for token in PRICE_QUERY_TOKENS)
+    has_generic_price_word = bool(re.search(r"\bprice\b", normalized))
+    if not (has_price_phrase or has_generic_price_word):
+        return False
+    if _looks_like_shopping_price_query(normalized):
+        return False
+    return _looks_like_finance_price_subject(normalized)
+
+
+def _looks_like_finance_price_subject(normalized_text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b("
+            r"bitcoin|btc|ethereum|eth|xrp|solana|sol|dogecoin|doge|cardano|ada|"
+            r"crypto|cryptocurrency|stock|stocks|share price|forex|fx|gold|silver|oil|"
+            r"nasdaq|dow|s&p|sp500|coin"
+            r")\b",
+            normalized_text,
+        )
+    )
+
+
+def _looks_like_shopping_price_query(normalized_text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b("
+            r"camera|cameras|hotel|hotels|flight|flights|laptop|phone|iphone|android|"
+            r"headphones|tv|monitor|bike|car|gift|watch|watches|shoe|shoes|bag|mic|microphone"
+            r")\b",
+            normalized_text,
+        )
+    )
+
+
+def _polish_response_text(text: str) -> str:
+    if not text:
+        return text
+    out = text
+    out = out.replace("\r\n", "\n")
+    out = re.sub(r"\*\*(.*?)\*\*", r"\1", out)
+    out = re.sub(r"__([^_]+)__", r"\1", out)
+    out = re.sub(r"(^|\n)(\d+)\.([A-Za-z])", r"\1\2. \3", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
 
 def _infer_price_subject(text: str) -> str:
@@ -1579,6 +1702,13 @@ def _is_calendar_cancel_reply(text: str) -> bool:
     return bool(re.match(r"^\s*(no|cancel|stop|don't|do not)\b", lowered))
 
 
+def _is_calendar_pause_reply(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return bool(re.match(r"^\s*(wait|hold|not now|later|pause)\b", lowered))
+
+
 def _is_calendar_draft_edit_reply(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
@@ -1646,6 +1776,145 @@ def _is_gmail_send_confirmation_reply(text: str) -> bool:
         or "yes, send draft" in lowered
         or "yes send draft" in lowered
         or re.match(r"^\s*(yes|ok|okay|go ahead|proceed)\b", lowered)
+    )
+
+
+def _is_meta_web_search_request(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    patterns = (
+        r"^can(?:not|'t)? you search the web\??$",
+        r"^could you search the web\??$",
+        r"^can you look it up\??$",
+        r"^please search the web\??$",
+        r"^search the web\??$",
+        r"^look this up\??$",
+    )
+    return any(re.match(pattern, lowered) for pattern in patterns)
+
+
+def _is_generic_web_followup_request(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    patterns = (
+        r"^search the web for more options\??$",
+        r"^search the web for more\??$",
+        r"^search the web for more results\??$",
+        r"^search for more options\??$",
+        r"^find more options\??$",
+        r"^show me more options\??$",
+        r"^more options\??$",
+    )
+    return any(re.match(pattern, lowered) for pattern in patterns)
+
+
+def _build_followup_web_query(followup_text: str, previous_query: str) -> str:
+    lowered = re.sub(r"\s+", " ", (followup_text or "").strip().lower())
+    if "few options" in lowered or "some options" in lowered:
+        return f"{previous_query.strip()} more options"
+    target = _extract_link_followup_target(lowered)
+    if target:
+        if _looks_like_specific_product_target(target) or _looks_like_purchase_intent_query(previous_query):
+            return f"{target} official product page buy"
+        return f"{target} official page"
+    if _is_link_only_web_followup_request(lowered):
+        return previous_query.strip()
+    if "more options" in lowered:
+        return f"{previous_query.strip()} more options"
+    if "more results" in lowered or lowered.startswith("more"):
+        return f"{previous_query.strip()} more results"
+    return previous_query.strip()
+
+
+def _is_link_only_web_followup_request(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    patterns = (
+        r"^can you link me\??$",
+        r"^could you link me\??$",
+        r"^link me\??$",
+        r"^send me links\??$",
+        r"^give me links\??$",
+        r"^show links\??$",
+        r"^can you send me the links\??$",
+        r"^can you send links\??$",
+    )
+    return any(re.match(pattern, lowered) for pattern in patterns)
+
+
+def _is_link_followup_request(text: str) -> bool:
+    return _is_link_only_web_followup_request(text) or bool(_extract_link_followup_target(text))
+
+
+def _extract_link_followup_target(text: str) -> str:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return ""
+    match = re.search(
+        r"\b(?:can you|could you|please)?\s*(?:send me|give me|show me|link me)?\s*links?\s*(?:to|for)\s+(?:the|teh|a|an)?\s*(.+)$",
+        lowered,
+    )
+    if not match:
+        match = re.search(
+            r"\b(?:can you|could you|please)?\s*link me\s*(?:to|for)\s+(?:the|teh|a|an)?\s*(.+)$",
+            lowered,
+        )
+    if not match:
+        return ""
+    target = re.sub(r"[?.!,]+$", "", match.group(1).strip())
+    # Drop long spec tails so query stays focused on the product model.
+    target = re.split(r"[:,]", target, maxsplit=1)[0].strip()
+    target = re.sub(r"\b(that|this)\b", "", target).strip()
+    target = re.sub(r"\b(the|a|an)\b", " ", target).strip()
+    target = re.sub(r"\b(laptop|notebook|computer)\b", " ", target).strip()
+    target = re.sub(r"\s+", " ", target).strip()
+    target = re.sub(r"\b(\w+)\s+\1\b", r"\1", target)
+    if target in {"few options", "some options", "options", "more options", "few", "some"}:
+        return ""
+    return target
+
+
+def _looks_like_specific_product_target(target: str) -> bool:
+    lowered = target.lower().strip()
+    if not lowered:
+        return False
+    model_keywords = (
+        "xps",
+        "thinkpad",
+        "macbook",
+        "zephyrus",
+        "predator",
+        "omen",
+        "blade",
+        "legion",
+        "inspiron",
+        "vivobook",
+        "zenbook",
+        "rog",
+    )
+    has_model_keyword = any(keyword in lowered for keyword in model_keywords)
+    has_model_number = bool(re.search(r"\b[a-z]{1,5}\s*\d{2,4}[a-z]?\b|\b\d{2,4}\b", lowered))
+    has_brand = bool(
+        re.search(
+            r"\b(dell|lenovo|apple|asus|msi|acer|hp|razer|alienware|samsung)\b",
+            lowered,
+        )
+    )
+    return has_model_keyword or (has_brand and has_model_number)
+
+
+def _looks_like_purchase_intent_query(query: str) -> bool:
+    lowered = (query or "").strip().lower()
+    if not lowered:
+        return False
+    return bool(
+        re.search(
+            r"\b(buy|purchase|price|pricing|budget|under \$?\d+|best|gaming|laptop|boat|tractor|car|model|option)s?\b",
+            lowered,
+        )
     )
 
 

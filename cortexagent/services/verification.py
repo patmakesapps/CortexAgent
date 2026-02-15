@@ -54,6 +54,34 @@ NUMERIC_SENSITIVE_CUES = {
     "quote",
 }
 
+SHOPPING_RESEARCH_CUES = {
+    "buy",
+    "purchase",
+    "shopping",
+    "recommend",
+    "recommendation",
+    "options",
+    "models",
+    "best",
+    "under ",
+    "budget",
+    "price range",
+}
+
+CRITICAL_HIGH_STAKES_CUES = {
+    "medical",
+    "diagnosis",
+    "treatment",
+    "prescription",
+    "legal",
+    "law",
+    "tax",
+    "irs",
+    "security advisory",
+    "vulnerability",
+    "hazard",
+}
+
 
 @dataclass(frozen=True)
 class VerificationProfile:
@@ -67,9 +95,20 @@ def assess_verification_profile(user_text: str) -> VerificationProfile:
     text = re.sub(r"\s+", " ", user_text.strip().lower())
     reasons: list[str] = []
 
-    if any(token in text for token in HIGH_STAKES_CUES):
+    if _looks_like_shopping_research(text) and not _contains_any_cue(text, CRITICAL_HIGH_STAKES_CUES):
+        shopping_reasons = ["shopping_research"]
+        if _contains_any_cue(text, TEMPORAL_CUES):
+            shopping_reasons.append("time_sensitive")
+        return VerificationProfile(
+            level="medium",
+            reasons=shopping_reasons,
+            requires_web_verification=True,
+            min_independent_sources=1,
+        )
+
+    if _contains_any_cue(text, HIGH_STAKES_CUES):
         reasons.append("high_stakes")
-    if any(token in text for token in TEMPORAL_CUES):
+    if _contains_any_cue(text, TEMPORAL_CUES):
         reasons.append("time_sensitive")
 
     if "high_stakes" in reasons or ("time_sensitive" in reasons and _looks_factual(text)):
@@ -153,7 +192,27 @@ def _looks_factual(text: str) -> bool:
 
 def _is_numeric_sensitive(text: str) -> bool:
     lowered = text.lower()
-    return any(cue in lowered for cue in NUMERIC_SENSITIVE_CUES)
+    return _contains_any_cue(lowered, NUMERIC_SENSITIVE_CUES)
+
+
+def _looks_like_shopping_research(text: str) -> bool:
+    if _contains_any_cue(text, SHOPPING_RESEARCH_CUES):
+        return True
+    return bool(
+        re.search(
+            r"\b(boat|tractor|car|truck|suv|motorcycle|laptop|phone|camera|tv|appliance|sofa|mower)\b",
+            text,
+        )
+        and re.search(r"\b(for|under|budget|people|use|need)\b", text)
+    )
+
+
+def _contains_any_cue(text: str, cues: set[str]) -> bool:
+    return any(_contains_cue(text, cue) for cue in cues)
+
+
+def _contains_cue(text: str, cue: str) -> bool:
+    return bool(re.search(rf"\b{re.escape(cue.strip())}\b", text))
 
 
 def _count_independent_sources(sources: list[dict[str, str]]) -> int:
