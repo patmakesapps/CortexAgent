@@ -87,6 +87,19 @@ GOOGLE_GMAIL_TERMS = (
     "send draft",
 )
 
+GOOGLE_DRIVE_TERMS = (
+    "google drive",
+    "drive",
+    "my files",
+    "shared with me",
+    "find file",
+    "find files",
+    "search drive",
+    "open drive",
+    "drive docs",
+    "drive folders",
+)
+
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -109,6 +122,12 @@ def _keyword_decision(user_text: str) -> RouteDecision:
             reason="matched_google_gmail_intent",
             confidence=0.95,
         )
+    if _matches_explicit_drive_intent(text):
+        return RouteDecision(
+            action="google_drive",
+            reason="matched_google_drive_intent",
+            confidence=0.94,
+        )
     if any(term in text for term in GOOGLE_CALENDAR_TERMS):
         return RouteDecision(
             action="google_calendar",
@@ -120,6 +139,12 @@ def _keyword_decision(user_text: str) -> RouteDecision:
             action="google_gmail",
             reason="matched_google_gmail_term",
             confidence=0.92,
+        )
+    if any(term in text for term in GOOGLE_DRIVE_TERMS):
+        return RouteDecision(
+            action="google_drive",
+            reason="matched_google_drive_term",
+            confidence=0.91,
         )
     if any(term in text for term in EXPLICIT_WEB_INTENT_TERMS):
         return RouteDecision(
@@ -189,6 +214,15 @@ def _matches_explicit_gmail_intent(text: str) -> bool:
     )
 
 
+def _matches_explicit_drive_intent(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(r"\b(find|search|look for|open|show|list|check)\b.*\b(file|files|folder|folders|doc|document|sheet|slides)\b", text)
+        and re.search(r"\b(drive|google drive)\b", text)
+    )
+
+
 def _extract_json(content: str) -> dict[str, object]:
     cleaned = content.strip()
     if cleaned.startswith("```"):
@@ -212,6 +246,7 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
         "Choose one action for the user request:\n"
         "- web_search: requires current/external/verifiable web data\n"
         "- google_calendar: user asks about their own schedule/events/calendar\n"
+        "- google_drive: user asks about their own files/docs/folders in Google Drive\n"
         "- google_gmail: user asks about their own inbox/threads/messages/drafts\n"
         "- chat: answer directly from internal reasoning/knowledge\n\n"
         "Rules:\n"
@@ -220,10 +255,11 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
         "- Prefer chat for timeless concepts, creative writing, coding help, editing, translation, and personal advice.\n"
         "- Keywords are hints, not the source of truth.\n"
         "- If user clearly refers to their personal calendar/events/schedule, prefer google_calendar.\n"
+        "- If user clearly refers to their personal drive files/docs/folders, prefer google_drive.\n"
         "- If user clearly refers to their inbox/emails/threads/drafts, prefer google_gmail.\n"
         "- Return strict JSON only.\n\n"
         "Output schema:\n"
-        '{"action":"web_search|google_calendar|google_gmail|chat","reason":"short_reason","confidence":0.0}'
+        '{"action":"web_search|google_calendar|google_drive|google_gmail|chat","reason":"short_reason","confidence":0.0}'
     )
 
     payload = {
@@ -267,7 +303,7 @@ def _llm_decision(user_text: str) -> RouteDecision | None:
     except Exception:
         return None
 
-    if action not in {"chat", "web_search", "google_calendar", "google_gmail"}:
+    if action not in {"chat", "web_search", "google_calendar", "google_drive", "google_gmail"}:
         return None
     if confidence < 0.0:
         confidence = 0.0
@@ -295,6 +331,12 @@ def decide_action(user_text: str, tools_enabled: bool, web_search_enabled: bool)
             action="google_gmail",
             reason="matched_google_gmail_intent",
             confidence=0.95,
+        )
+    if _matches_explicit_drive_intent(text):
+        return RouteDecision(
+            action="google_drive",
+            reason="matched_google_drive_intent",
+            confidence=0.94,
         )
 
     if web_search_enabled:

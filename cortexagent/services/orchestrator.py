@@ -137,10 +137,10 @@ class AgentOrchestrator:
                 reason=f"verification_override:{','.join(verification.reasons)}",
                 confidence=max(route.confidence, 0.9),
             )
-        if route.action in {"google_calendar", "google_gmail"}:
+        if route.action in {"google_calendar", "google_gmail", "google_drive"}:
             self._last_tool_action_by_thread[thread_id] = route.action
 
-        if route.action not in {"web_search", "google_calendar", "google_gmail"}:
+        if route.action not in {"web_search", "google_calendar", "google_gmail", "google_drive"}:
             assistant_text = self.ltm_client.chat(
                 thread_id=thread_id,
                 text=text,
@@ -369,6 +369,94 @@ class AgentOrchestrator:
                 authorization=authorization,
                 decision_action=route.action,
                 capability_label="Gmail",
+                extra_meta=token_meta,
+            )
+            return OrchestratorResult(
+                response=assistant_text,
+                decision=AgentDecision(
+                    action=route.action,
+                    reason=route.reason,
+                    confidence=route.confidence,
+                ),
+                sources=sources,
+            )
+
+        if route.action == "google_drive":
+            tool = self.tool_registry.get("google_drive")
+            try:
+                access_token, token_meta = self._resolve_google_access_token(
+                    authorization=authorization,
+                    integration_label="Google Drive",
+                )
+            except Exception as exc:
+                assistant_text = str(exc)
+                self._persist_nonfatal_tool_error_events(
+                    thread_id=thread_id,
+                    user_text=text,
+                    assistant_text=assistant_text,
+                    query=text,
+                    authorization=authorization,
+                    decision_action="google_drive",
+                    tool_name="google_drive",
+                    capability_label="Google Drive",
+                )
+                return OrchestratorResult(
+                    response=assistant_text,
+                    decision=AgentDecision(
+                        action="google_drive",
+                        reason="google_drive_auth_failed",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+
+            try:
+                result = tool.run(
+                    ToolContext(
+                        thread_id=thread_id,
+                        user_text=text,
+                        tool_meta={
+                            "access_token": access_token,
+                            "max_results": 8,
+                        },
+                    )
+                )
+            except Exception as exc:
+                assistant_text = (
+                    "I routed this request to Google Drive, but the request failed. "
+                    f"Error: {exc}"
+                )
+                self._persist_nonfatal_tool_error_events(
+                    thread_id=thread_id,
+                    user_text=text,
+                    assistant_text=assistant_text,
+                    query=text,
+                    authorization=authorization,
+                    decision_action="google_drive",
+                    tool_name="google_drive",
+                    capability_label="Google Drive",
+                )
+                return OrchestratorResult(
+                    response=assistant_text,
+                    decision=AgentDecision(
+                        action="google_drive",
+                        reason="google_drive_failed",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+
+            assistant_text, sources = _format_google_drive_response(result.items)
+            self._persist_tool_events(
+                thread_id=thread_id,
+                user_text=text,
+                assistant_text=assistant_text,
+                tool_name=result.tool_name,
+                query=result.query,
+                sources=sources,
+                authorization=authorization,
+                decision_action=route.action,
+                capability_label="Google Drive",
                 extra_meta=token_meta,
             )
             return OrchestratorResult(
@@ -813,6 +901,32 @@ def _format_google_gmail_response(
         )
     if lines and not lines[-1].strip():
         lines.pop()
+    return ("\n".join(lines), sources)
+
+
+def _format_google_drive_response(
+    items: list,
+) -> tuple[str, list[dict[str, str]]]:
+    if not items:
+        return ("I could not find Google Drive results for that request.", [])
+
+    lines = ["Google Drive results:"]
+    sources: list[dict[str, str]] = []
+    for idx, item in enumerate(items, start=1):
+        title = str(getattr(item, "title", "")).strip() or f"File {idx}"
+        snippet = str(getattr(item, "snippet", "")).strip()
+        item_url = str(getattr(item, "url", "")).strip() or "https://drive.google.com/drive/my-drive"
+        lines.append(f"{idx}. {title}")
+        if snippet:
+            lines.append(f"   {snippet}")
+        lines.append(f"   Link: {item_url}")
+        sources.append(
+            {
+                "title": title,
+                "url": item_url,
+                "snippet": snippet,
+            }
+        )
     return ("\n".join(lines), sources)
 
 
@@ -1325,7 +1439,7 @@ def _maybe_continue_recent_tool_route(
     text: str,
     previous_action: str | None,
 ) -> RouteDecision | None:
-    if previous_action not in {"google_calendar", "google_gmail"}:
+    if previous_action not in {"google_calendar", "google_gmail", "google_drive"}:
         return None
     lowered = text.strip().lower()
     if not _looks_like_contextual_tool_followup(text):
@@ -1338,11 +1452,12 @@ def _maybe_continue_recent_tool_route(
         r"\b(calendar|schedule|event|meeting)\b", lowered
     ):
         return None
-    reason = (
-        "calendar_context_followup"
-        if previous_action == "google_calendar"
-        else "gmail_context_followup"
-    )
+    if previous_action == "google_calendar":
+        reason = "calendar_context_followup"
+    elif previous_action == "google_gmail":
+        reason = "gmail_context_followup"
+    else:
+        reason = "drive_context_followup"
     return RouteDecision(action=previous_action, reason=reason, confidence=0.9)
 
 
@@ -1732,7 +1847,7 @@ def _extract_calendar_draft_text(items: list, fallback: str) -> str:
 
 
 def _prevent_unexecuted_action_claims(assistant_text: str, routed_action: str) -> str:
-    if routed_action in {"google_calendar", "google_gmail"}:
+    if routed_action in {"google_calendar", "google_gmail", "google_drive"}:
         return assistant_text
     lowered = (assistant_text or "").strip().lower()
     if not lowered:

@@ -7,6 +7,7 @@ v1 goal:
 - Trigger web search when the user asks for current/external information
 - Persist both user and assistant messages to CortexLTM even when tools are used
 - Support Google Calendar read + write flows with explicit user confirmation
+- Support Google Drive read flows for file discovery/open links
 - Support Gmail list/read/draft flows, plus confirmation-gated send
 
 ## Release Notes (Feb 14, 2026)
@@ -35,11 +36,15 @@ v1 goal:
   - send drafts only after explicit confirmation
   - optional recipient-domain policy via `GMAIL_ALLOWED_RECIPIENT_DOMAINS`
   - prompt-injection line filtering on email content previews
+- Added Google Drive tool support:
+  - list/search recent files and return direct Drive links
+  - routes Drive-specific prompts to `google_drive`
+  - uses read-only metadata scope for safety
 
 ## Architecture
 
 - `cortexagent/router/intent_router.py`
-  - Heuristic/model intent gating (`chat` vs `web_search` vs `google_calendar`)
+  - Heuristic/model intent gating (`chat` vs `web_search` vs `google_calendar` vs `google_drive` vs `google_gmail`)
 - `cortexagent/tools/base.py`
   - Generic tool interfaces
 - `cortexagent/tools/registry.py`
@@ -50,6 +55,8 @@ v1 goal:
   - Google Calendar list + create logic (confirmation-gated writes)
 - `cortexagent/tools/google_gmail.py`
   - Gmail thread list/read, draft-reply, and confirmation-gated send
+- `cortexagent/tools/google_drive.py`
+  - Google Drive file discovery/listing and deep links (read-only)
 - `cortexagent/services/cortexltm_client.py`
   - HTTP client for CortexLTM endpoints
 - `cortexagent/services/orchestrator.py`
@@ -125,7 +132,7 @@ Optional:
 ## Route
 
 - `POST /v1/agent/threads/{thread_id}/chat`
-  - If tool intent is detected and enabled, runs web search or Google Calendar action.
+  - If tool intent is detected and enabled, runs web search, Google Calendar, Google Drive, or Gmail action.
   - Otherwise forwards to CortexLTM `/v1/threads/{thread_id}/chat`.
 - `POST /v1/agent/integrations/google/connect`
   - Exchanges Google OAuth `code` for tokens, validates caller via bearer token, and upserts a row in `ltm_connected_accounts`.

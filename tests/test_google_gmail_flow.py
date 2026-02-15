@@ -139,6 +139,14 @@ class GoogleGmailFlowTests(unittest.TestCase):
         )
         self.assertEqual(result.action, "google_gmail")
 
+    def test_router_picks_google_drive(self):
+        result = decide_action(
+            user_text="find file roadmap in my google drive",
+            tools_enabled=True,
+            web_search_enabled=True,
+        )
+        self.assertEqual(result.action, "google_drive")
+
     def test_router_picks_google_gmail_for_typo_send_email_phrase(self):
         result = decide_action(
             user_text="sned an email to anthony@example.com saying hey",

@@ -18,7 +18,13 @@ from cortexagent.services import (
     GoogleOAuthService,
     resolve_user_id_from_authorization,
 )
-from cortexagent.tools import GoogleCalendarTool, GoogleGmailTool, ToolRegistry, WebSearchTool
+from cortexagent.tools import (
+    GoogleCalendarTool,
+    GoogleDriveTool,
+    GoogleGmailTool,
+    ToolRegistry,
+    WebSearchTool,
+)
 
 app = FastAPI(title="CortexAgent", version="0.1.0")
 
@@ -28,6 +34,7 @@ def _build_orchestrator() -> AgentOrchestrator:
     if settings.web_search_enabled:
         registry.register(WebSearchTool())
     registry.register(GoogleCalendarTool())
+    registry.register(GoogleDriveTool())
     registry.register(GoogleGmailTool())
 
     ltm_client = CortexLTMClient(
