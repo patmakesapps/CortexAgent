@@ -287,6 +287,14 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         )
         self.assertEqual(result.action, "google_calendar")
 
+    def test_router_picks_google_calendar_for_reschedule_meeting_phrase(self):
+        result = decide_action(
+            user_text="reschedule that meeting for 3pm",
+            tools_enabled=True,
+            web_search_enabled=True,
+        )
+        self.assertEqual(result.action, "google_calendar")
+
     def test_orchestrator_refreshes_google_token_when_expired(self):
         account = _active_account()
         resolved = ResolvedProviderToken(
@@ -381,7 +389,64 @@ class GoogleCalendarFlowTests(unittest.TestCase):
 
         self.assertEqual(first.decision.action, "google_calendar")
         self.assertEqual(second.decision.action, "google_calendar")
-        self.assertEqual(second.decision.reason, "calendar_context_followup")
+        self.assertIn(
+            second.decision.reason,
+            {"calendar_context_followup", "matched_explicit_google_calendar_write_intent"},
+        )
+
+    def test_orchestrator_routes_move_it_followup_to_recent_calendar_tool(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=None,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=True,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="new-access",
+                refresh_token="new-refresh",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        registry = ToolRegistry()
+        registry.register(_FakeGoogleCalendarTool())
+
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="check my calendar",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-1",
+                text="move it to 3pm",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertEqual(first.decision.action, "google_calendar")
+        self.assertEqual(second.decision.action, "google_calendar")
+        self.assertIn(
+            second.decision.reason,
+            {"calendar_context_followup", "matched_explicit_google_calendar_write_intent"},
+        )
 
     def test_orchestrator_returns_reauth_message_when_refresh_fails(self):
         account = _active_account()

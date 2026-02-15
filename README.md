@@ -40,6 +40,10 @@ v1 goal:
   - list/search recent files and return direct Drive links
   - routes Drive-specific prompts to `google_drive`
   - uses read-only metadata scope for safety
+- Added multi-step orchestration mode for compound prompts:
+  - detects multi-intent requests spanning Gmail + Drive + Calendar (+ optional web)
+  - executes ordered tool steps in a single turn
+  - stores structured per-step pipeline metadata in thread events
 
 ## Architecture
 

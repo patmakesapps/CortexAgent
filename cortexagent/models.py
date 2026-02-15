@@ -17,6 +17,7 @@ class AgentChatResponse(BaseModel):
     response: str
     decision: AgentDecision
     sources: list[dict[str, str]] = Field(default_factory=list)
+    tool_pipeline: list[dict[str, object]] | None = None
 
 
 class GoogleConnectRequest(BaseModel):

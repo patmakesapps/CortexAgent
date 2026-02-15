@@ -121,17 +121,27 @@ class GoogleGmailTool(Tool):
             thread_id = str(row.get("id") or "").strip()
             if not thread_id:
                 continue
-            details = self._get_thread_metadata(access_token=access_token, thread_id=thread_id)
+            details = self._get_thread_metadata(
+                access_token=access_token,
+                thread_id=thread_id,
+                include_body=True,
+            )
             if _has_excluded_inbox_labels(details.get("label_ids") or ""):
                 continue
             subject = details.get("subject") or "(no subject)"
             sender = details.get("from") or "Unknown sender"
-            snippet = details.get("snippet") or ""
+            body = details.get("body") or details.get("snippet") or ""
+            safe_body, flagged = _sanitize_email_text(body)
+            snippet = f"From: {sender}\n\n{safe_body}".strip()
+            if flagged:
+                snippet += (
+                    "\n\n[Security] Potential prompt-injection lines were filtered from this email."
+                )
             out.append(
                 ToolResultItem(
                     title=f"Thread {thread_id} | {subject}",
                     url=f"https://mail.google.com/mail/u/0/#inbox/{thread_id}",
-                    snippet=f"From: {sender} | {snippet}".strip(" |"),
+                    snippet=snippet,
                 )
             )
             if len(out) >= max_results:
@@ -148,15 +158,20 @@ class GoogleGmailTool(Tool):
             )
             return self._build_read_item(thread_id=thread_id, details=details)
 
-        newest_threads = self._list_recent_threads(
+        candidate_threads = self._list_recent_threads(
             access_token=access_token,
-            max_results=1,
+            max_results=8,
             inbox_query=inbox_query,
         )
-        if not newest_threads:
+        if not candidate_threads:
             raise RuntimeError("I could not find any inbox threads to read.")
-        newest_title = newest_threads[0].title
-        inferred = _extract_thread_id(newest_title)
+        inferred = _select_thread_id_for_read_intent(
+            user_text=user_text,
+            candidates=candidate_threads,
+        )
+        if not inferred:
+            newest_title = candidate_threads[0].title
+            inferred = _extract_thread_id(newest_title)
         if not inferred:
             raise RuntimeError("Could not resolve thread id for the newest email.")
         details = self._get_thread_metadata(
@@ -486,6 +501,15 @@ def _has_excluded_inbox_labels(raw_labels: str) -> bool:
 
 def _is_read_message_intent(text: str) -> bool:
     lowered = text.strip().lower()
+    if re.search(
+        r"\bwhat\s+does\b.*\b(email|message|thread)\b.*\b(say|says)\b",
+        lowered,
+    ):
+        return True
+    if re.search(r"\btell me\b.*\b(email|message|thread)\b.*\b(say|says)\b", lowered):
+        return True
+    if re.search(r"\bwhat did\b.*\b(email|message|thread)\b.*\bsay\b", lowered):
+        return True
     return bool(
         re.search(r"\b(read|open|show)\b", lowered)
         and re.search(r"\b(email|message|thread|latest)\b", lowered)
@@ -560,6 +584,61 @@ def _extract_thread_id(text: str) -> str | None:
     if match:
         return match.group(1).strip()
     return None
+
+
+def _select_thread_id_for_read_intent(
+    user_text: str,
+    candidates: list[ToolResultItem],
+) -> str | None:
+    hint = _extract_read_target_hint(user_text)
+    if not hint:
+        return None
+    lowered_hint = hint.lower()
+    for item in candidates:
+        haystack = f"{item.title} {item.snippet}".lower()
+        if lowered_hint in haystack:
+            thread_id = _extract_thread_id(item.title)
+            if thread_id:
+                return thread_id
+    hint_tokens = [token for token in re.split(r"[^a-z0-9]+", lowered_hint) if len(token) >= 4]
+    if not hint_tokens:
+        return None
+    best_thread: str | None = None
+    best_score = 0
+    for item in candidates:
+        haystack = f"{item.title} {item.snippet}".lower()
+        score = sum(1 for token in hint_tokens if token in haystack)
+        if score > best_score:
+            thread_id = _extract_thread_id(item.title)
+            if thread_id:
+                best_thread = thread_id
+                best_score = score
+    return best_thread
+
+
+def _extract_read_target_hint(user_text: str) -> str:
+    lowered = re.sub(r"\s+", " ", (user_text or "").strip().lower())
+    if not lowered:
+        return ""
+    patterns = [
+        r"\bwhat does the (.+?) email say\b",
+        r"\bwhat does (.+?) email say\b",
+        r"\bwhat did the (.+?) email say\b",
+        r"\btell me what the (.+?) email says\b",
+        r"\btell me what (.+?) says\b",
+        r"\bread the (.+?) email\b",
+        r"\bopen the (.+?) email\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        candidate = re.sub(r"\b(from|about|thread|message|email)\b", " ", candidate)
+        candidate = re.sub(r"\s+", " ", candidate).strip(" .,!?:;")
+        if candidate:
+            return candidate
+    return ""
 
 
 def _extract_draft_id(text: str) -> str | None:

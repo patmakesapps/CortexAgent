@@ -27,6 +27,26 @@ class OrchestratorResult:
     response: str
     decision: AgentDecision
     sources: list[dict[str, str]]
+    tool_pipeline: list[dict[str, object]] | None = None
+
+
+@dataclass(frozen=True)
+class OrchestrationStep:
+    action: str
+    query: str
+
+
+@dataclass(frozen=True)
+class OrchestrationStepResult:
+    action: str
+    tool_name: str
+    query: str
+    assistant_text: str
+    sources: list[dict[str, str]]
+    success: bool
+    reason: str
+    capability_label: str
+    extra_meta: dict[str, object] | None = None
 
 
 class AgentOrchestrator:
@@ -46,6 +66,7 @@ class AgentOrchestrator:
         self._last_tool_action_by_thread: dict[str, str] = {}
         self._last_non_meta_user_text_by_thread: dict[str, str] = {}
         self._last_web_search_query_by_thread: dict[str, str] = {}
+        self._last_pipeline_results_by_thread: dict[str, list[dict[str, object]]] = {}
 
     def handle_chat(
         self,
@@ -117,6 +138,16 @@ class AgentOrchestrator:
                 ),
                 sources=[],
             )
+
+        if settings.agent_tools_enabled:
+            pipeline_steps = _build_multi_step_plan(text)
+            if pipeline_steps:
+                return self._run_multi_step_pipeline(
+                    thread_id=thread_id,
+                    text=text,
+                    authorization=authorization,
+                    steps=pipeline_steps,
+                )
 
         verification = assess_verification_profile(text)
         if pending_calendar_draft and _is_calendar_draft_edit_reply(text):
@@ -663,6 +694,7 @@ class AgentOrchestrator:
         meta: dict[str, object],
         authorization: str | None,
     ) -> None:
+        safe_content = _clamp_event_content(content)
         attempts = 0
         last_error: Exception | None = None
         while attempts < 2:
@@ -671,7 +703,7 @@ class AgentOrchestrator:
                 self.ltm_client.add_event(
                     thread_id=thread_id,
                     actor=actor,
-                    content=content,
+                    content=safe_content,
                     meta=meta,
                     authorization=authorization,
                 )
@@ -783,6 +815,368 @@ class AgentOrchestrator:
             },
         )
 
+    def _run_multi_step_pipeline(
+        self,
+        thread_id: str,
+        text: str,
+        authorization: str | None,
+        steps: list[OrchestrationStep],
+    ) -> OrchestratorResult:
+        step_results: list[OrchestrationStepResult] = []
+        for step in steps:
+            result = self._execute_pipeline_step(
+                thread_id=thread_id,
+                user_text=text,
+                step=step,
+                authorization=authorization,
+            )
+            step_results.append(result)
+            if result.success and result.action in {"google_calendar", "google_gmail", "google_drive"}:
+                self._last_tool_action_by_thread[thread_id] = result.action
+            if result.success and result.action == "web_search":
+                self._last_web_search_query_by_thread[thread_id] = result.query
+
+        combined_sources = _dedupe_sources_by_url(
+            [source for step in step_results for source in step.sources]
+        )
+        response = _format_orchestration_response(step_results=step_results)
+        decision = AgentDecision(
+            action="orchestration",
+            reason="multi_step_pipeline_executed",
+            confidence=0.93,
+        )
+        self._persist_orchestration_events(
+            thread_id=thread_id,
+            user_text=text,
+            assistant_text=response,
+            authorization=authorization,
+            step_results=step_results,
+            sources=combined_sources,
+        )
+        self._last_pipeline_results_by_thread[thread_id] = [
+            _serialize_orchestration_step_result(step) for step in step_results
+        ]
+        return OrchestratorResult(
+            response=response,
+            decision=decision,
+            sources=combined_sources,
+            tool_pipeline=[
+                _serialize_orchestration_step_result(step) for step in step_results
+            ],
+        )
+
+    def _execute_pipeline_step(
+        self,
+        thread_id: str,
+        user_text: str,
+        step: OrchestrationStep,
+        authorization: str | None,
+    ) -> OrchestrationStepResult:
+        action = step.action
+        query = step.query
+        if action == "google_calendar":
+            tool_name = "google_calendar"
+            capability_label = "Google Calendar"
+            try:
+                access_token, token_meta = self._resolve_google_access_token(
+                    authorization=authorization,
+                    integration_label=capability_label,
+                )
+            except Exception as exc:
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=tool_name,
+                    query=query,
+                    assistant_text=str(exc),
+                    sources=[],
+                    success=False,
+                    reason="google_calendar_auth_failed",
+                    capability_label=capability_label,
+                )
+            try:
+                tool = self.tool_registry.get(tool_name)
+                result = tool.run(
+                    ToolContext(
+                        thread_id=thread_id,
+                        user_text=query,
+                        tool_meta={"access_token": access_token, "max_results": 8},
+                    )
+                )
+                assistant_text, sources = _format_google_calendar_response(result.items)
+                assistant_text = _polish_response_text(assistant_text)
+                if _is_calendar_confirmation_required_items(result.items):
+                    self._pending_calendar_drafts[thread_id] = _extract_calendar_draft_text(
+                        items=result.items,
+                        fallback=query,
+                    )
+                elif _is_calendar_created_items(result.items):
+                    self._pending_calendar_drafts.pop(thread_id, None)
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=result.tool_name,
+                    query=result.query,
+                    assistant_text=assistant_text,
+                    sources=sources,
+                    success=True,
+                    reason="ok",
+                    capability_label=capability_label,
+                    extra_meta=token_meta,
+                )
+            except Exception as exc:
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=tool_name,
+                    query=query,
+                    assistant_text=(
+                        "I routed this step to Google Calendar, but it failed. "
+                        f"Error: {exc}"
+                    ),
+                    sources=[],
+                    success=False,
+                    reason="google_calendar_failed",
+                    capability_label=capability_label,
+                )
+
+        if action == "google_gmail":
+            tool_name = "google_gmail"
+            capability_label = "Gmail"
+            try:
+                access_token, token_meta = self._resolve_google_access_token(
+                    authorization=authorization,
+                    integration_label=capability_label,
+                )
+            except Exception as exc:
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=tool_name,
+                    query=query,
+                    assistant_text=str(exc),
+                    sources=[],
+                    success=False,
+                    reason="google_gmail_auth_failed",
+                    capability_label=capability_label,
+                )
+            allowed_domains = [
+                value.strip().lower()
+                for value in settings.gmail_allowed_recipient_domains.split(",")
+                if value.strip()
+            ]
+            try:
+                tool = self.tool_registry.get(tool_name)
+                result = tool.run(
+                    ToolContext(
+                        thread_id=thread_id,
+                        user_text=query,
+                        tool_meta={
+                            "access_token": access_token,
+                            "max_results": 8,
+                            "allowed_recipient_domains": allowed_domains,
+                        },
+                    )
+                )
+                assistant_text, sources = _format_google_gmail_response(result.items)
+                assistant_text = _polish_response_text(assistant_text)
+                if _is_gmail_send_confirmation_required_items(result.items):
+                    self._pending_gmail_send_requests[thread_id] = _extract_gmail_send_pending_text(
+                        items=result.items,
+                        fallback=query,
+                    )
+                elif _is_gmail_sent_items(result.items):
+                    self._pending_gmail_send_requests.pop(thread_id, None)
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=result.tool_name,
+                    query=result.query,
+                    assistant_text=assistant_text,
+                    sources=sources,
+                    success=True,
+                    reason="ok",
+                    capability_label=capability_label,
+                    extra_meta=token_meta,
+                )
+            except Exception as exc:
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=tool_name,
+                    query=query,
+                    assistant_text=(
+                        "I routed this step to Gmail, but it failed. "
+                        f"Error: {exc}"
+                    ),
+                    sources=[],
+                    success=False,
+                    reason="google_gmail_failed",
+                    capability_label=capability_label,
+                )
+
+        if action == "google_drive":
+            tool_name = "google_drive"
+            capability_label = "Google Drive"
+            try:
+                access_token, token_meta = self._resolve_google_access_token(
+                    authorization=authorization,
+                    integration_label=capability_label,
+                )
+            except Exception as exc:
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=tool_name,
+                    query=query,
+                    assistant_text=str(exc),
+                    sources=[],
+                    success=False,
+                    reason="google_drive_auth_failed",
+                    capability_label=capability_label,
+                )
+            try:
+                tool = self.tool_registry.get(tool_name)
+                result = tool.run(
+                    ToolContext(
+                        thread_id=thread_id,
+                        user_text=query,
+                        tool_meta={"access_token": access_token, "max_results": 8},
+                    )
+                )
+                assistant_text, sources = _format_google_drive_response(result.items)
+                assistant_text = _polish_response_text(assistant_text)
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=result.tool_name,
+                    query=result.query,
+                    assistant_text=assistant_text,
+                    sources=sources,
+                    success=True,
+                    reason="ok",
+                    capability_label=capability_label,
+                    extra_meta=token_meta,
+                )
+            except Exception as exc:
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=tool_name,
+                    query=query,
+                    assistant_text=(
+                        "I routed this step to Google Drive, but it failed. "
+                        f"Error: {exc}"
+                    ),
+                    sources=[],
+                    success=False,
+                    reason="google_drive_failed",
+                    capability_label=capability_label,
+                )
+
+        if action == "web_search":
+            tool_name = "web_search"
+            capability_label = "Web Search"
+            try:
+                tool = self.tool_registry.get(tool_name)
+                result = tool.run(ToolContext(thread_id=thread_id, user_text=query))
+                assistant_text, sources = _format_web_search_response(result.items, user_text)
+                assistant_text = _polish_response_text(assistant_text)
+                assistant_text = _verify_numeric_claims(
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    sources=sources,
+                )
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=result.tool_name,
+                    query=result.query,
+                    assistant_text=assistant_text,
+                    sources=sources,
+                    success=True,
+                    reason="ok",
+                    capability_label=capability_label,
+                    extra_meta=None,
+                )
+            except Exception as exc:
+                return OrchestrationStepResult(
+                    action=action,
+                    tool_name=tool_name,
+                    query=query,
+                    assistant_text=(
+                        "I routed this step to web search, but it failed. "
+                        f"Error: {exc}"
+                    ),
+                    sources=[],
+                    success=False,
+                    reason="web_search_failed",
+                    capability_label=capability_label,
+                )
+
+        return OrchestrationStepResult(
+            action=action,
+            tool_name=action,
+            query=query,
+            assistant_text=f"Unsupported orchestration step action: {action}",
+            sources=[],
+            success=False,
+            reason="unsupported_step_action",
+            capability_label=_capability_label_for_action(action),
+        )
+
+    def _persist_orchestration_events(
+        self,
+        thread_id: str,
+        user_text: str,
+        assistant_text: str,
+        authorization: str | None,
+        step_results: list[OrchestrationStepResult],
+        sources: list[dict[str, str]],
+    ) -> None:
+        try:
+            user_meta = {
+                "source": "cortexagent",
+                "decision": "orchestration",
+                "tool_pipeline": {
+                    "step_count": len(step_results),
+                    "steps": [
+                        {
+                            "action": step.action,
+                            "tool": step.tool_name,
+                            "query": step.query,
+                            "success": step.success,
+                            "reason": step.reason,
+                        }
+                        for step in step_results
+                    ],
+                },
+            }
+            self._add_event_with_retry(
+                thread_id=thread_id,
+                actor="user",
+                content=user_text,
+                meta=user_meta,
+                authorization=authorization,
+            )
+            assistant_meta = {
+                "source": "cortexagent_orchestration",
+                "tool_pipeline": user_meta["tool_pipeline"],
+                "source_urls": [source.get("url", "") for source in sources if source.get("url")],
+                "agent_trace": {
+                    "version": 1,
+                    "source": "cortex-agent",
+                    "action": "orchestration",
+                    "capabilities": [
+                        {
+                            "id": step.action,
+                            "type": "tool",
+                            "label": step.capability_label,
+                        }
+                        for step in step_results
+                    ],
+                },
+            }
+            self._add_event_with_retry(
+                thread_id=thread_id,
+                actor="assistant",
+                content=assistant_text,
+                meta=assistant_meta,
+                authorization=authorization,
+            )
+        except Exception:
+            return
+
 
 def _format_web_search_response(
     items: list, user_text: str
@@ -857,6 +1251,14 @@ def _format_web_search_response(
         lines.append(f"- {src['title']} | {src['url']}")
 
     return "\n".join(lines), sources
+
+
+def _clamp_event_content(content: str, max_len: int = 5800) -> str:
+    text = (content or "").strip()
+    if len(text) <= max_len:
+        return text
+    clipped = text[:max_len].rstrip()
+    return f"{clipped}\n\n[Truncated for event storage limit]"
 
 
 def _format_google_calendar_response(
@@ -1045,18 +1447,58 @@ def _format_gmail_item_details(snippet: str) -> list[str]:
     first = expanded[0]
     if first.lower().startswith("from:"):
         sender = first[5:].strip() or "Unknown sender"
-        preview = ""
+        preview_rows: list[str] = []
+        security_rows: list[str] = []
         for row in expanded[1:]:
             lowered = row.lower()
             if lowered.startswith("[security]"):
+                security_rows.append(row)
                 continue
-            preview = row
-            break
+            preview_rows.append(row)
         out = [f"From: {sender}"]
-        if preview:
-            out.append(f"Preview: {preview}")
+        if preview_rows:
+            readable_rows = _filter_gmail_body_noise(preview_rows)
+            if not readable_rows:
+                readable_rows = [
+                    "This message body is mostly links/buttons. Open in Gmail for full formatted content."
+                ]
+            if len(readable_rows) == 1:
+                out.append(f"Preview: {readable_rows[0]}")
+            else:
+                out.append(f"Body: {readable_rows[0]}")
+                out.extend(readable_rows[1:])
+        out.extend(security_rows)
         return out
     return expanded
+
+
+def _filter_gmail_body_noise(rows: list[str]) -> list[str]:
+    out: list[str] = []
+    for row in rows:
+        line = row.strip()
+        if not line:
+            continue
+        if _is_url_noise_line(line):
+            continue
+        out.append(line)
+    return out[:12]
+
+
+def _is_url_noise_line(line: str) -> bool:
+    lowered = line.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return True
+    if "linkedin.com/comm/jobs" in lowered:
+        return True
+    if "trackingid=" in lowered or "trk" in lowered or "utm_" in lowered:
+        return True
+    url_count = len(re.findall(r"https?://", line, flags=re.IGNORECASE))
+    if url_count >= 1 and len(line) > 90:
+        return True
+    # "View job: https://..." style call-to-action rows are noisy in plain text cards.
+    if re.match(r"^[a-z][a-z\s]{2,40}:\s*https?://", lowered):
+        return True
+    return False
 
 
 def _expand_tool_item_details(snippet: str) -> list[str]:
@@ -1528,6 +1970,186 @@ def _friendly_local_timestamp() -> str:
     return stamp.replace(" at 0", " at ")
 
 
+def _build_multi_step_plan(text: str) -> list[OrchestrationStep]:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return []
+
+    gmail_requested = bool(
+        re.search(r"\b(email|gmail|inbox|thread|reply|draft|send)\b", lowered)
+    )
+    drive_requested = bool(
+        re.search(r"\b(drive|doc|document|file|folder|attach)\b", lowered)
+    )
+    calendar_requested = bool(
+        re.search(r"\b(calendar|meeting|schedule|event|reschedule|remind|availability)\b", lowered)
+    )
+    web_requested = bool(
+        re.search(r"\b(web|search|look up|lookup|latest|news|online)\b", lowered)
+    )
+
+    requested_actions: list[str] = []
+    if gmail_requested:
+        requested_actions.append("google_gmail")
+    if drive_requested:
+        requested_actions.append("google_drive")
+    if calendar_requested:
+        requested_actions.append("google_calendar")
+    if web_requested:
+        requested_actions.append("web_search")
+
+    if len(requested_actions) < 2:
+        return []
+
+    ordered = ["google_gmail", "google_drive", "google_calendar", "web_search"]
+    if gmail_requested and calendar_requested:
+        calendar_pos = _first_keyword_position(
+            lowered,
+            [r"\bcalendar\b", r"\bmeeting\b", r"\bschedule\b", r"\bevent\b"],
+        )
+        gmail_pos = _first_keyword_position(
+            lowered,
+            [r"\bgmail\b", r"\bemail\b", r"\binbox\b"],
+        )
+        if (
+            calendar_pos >= 0
+            and gmail_pos >= 0
+            and calendar_pos < gmail_pos
+            and re.search(r"\b(then|after|followed by|next)\b", lowered)
+        ):
+            ordered = ["google_calendar", "google_gmail", "google_drive", "web_search"]
+    steps: list[OrchestrationStep] = []
+    for action in ordered:
+        if action not in requested_actions:
+            continue
+        steps.append(
+            OrchestrationStep(
+                action=action,
+                query=_build_step_query(action=action, user_text=text),
+            )
+        )
+    return steps
+
+
+def _build_step_query(action: str, user_text: str) -> str:
+    lowered = re.sub(r"\s+", " ", (user_text or "").strip().lower())
+    if action == "google_gmail":
+        email_match = re.search(
+            r"\bemail\s+(?:to\s+)?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})\b",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+        if email_match and re.search(r"\b(confirm|confirmation|confirming)\b", lowered):
+            to_addr = email_match.group(1).strip()
+            calendar_fields = _extract_calendar_fields(user_text)
+            when_parts: list[str] = []
+            if calendar_fields.get("day"):
+                when_parts.append(str(calendar_fields["day"]))
+            if calendar_fields.get("time"):
+                when_parts.append(str(calendar_fields["time"]))
+            when_text = " at ".join(when_parts) if len(when_parts) == 2 else (
+                when_parts[0] if when_parts else "the scheduled time"
+            )
+            return (
+                f'send an email to {to_addr} say "Confirming our meeting for {when_text}."'
+            )
+        if re.search(r"\bwhat does\b.*\bemail\b.*\b(say|says)\b", lowered):
+            return user_text.strip()
+        if re.search(r"\btell me\b.*\bemail\b.*\b(say|says)\b", lowered):
+            return user_text.strip()
+        if "summarize" in lowered:
+            return "check my inbox and summarize the most relevant email thread"
+        if re.search(r"\b(reply|draft|send)\b", lowered):
+            return f"draft an email reply based on this request: {user_text.strip()}"
+        return "check my latest inbox emails"
+    if action == "google_drive":
+        if re.search(r"\b(attach|relevant|matching)\b", lowered):
+            return f"find the most relevant Google Drive file for this request: {user_text.strip()}"
+        return "find relevant files in Google Drive"
+    if action == "google_calendar":
+        if re.search(r"\b(create|schedule|meeting|event|reschedule|move|time|availability)\b", lowered):
+            return f"schedule or update a calendar event based on this request: {user_text.strip()}"
+        if "remind" in lowered:
+            return f"add a reminder event based on this request: {user_text.strip()}"
+        return "check my calendar and propose times"
+    return user_text.strip()
+
+
+def _first_keyword_position(text: str, patterns: list[str]) -> int:
+    found_positions: list[int] = []
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            found_positions.append(match.start())
+    if not found_positions:
+        return -1
+    return min(found_positions)
+
+
+def _format_orchestration_response(step_results: list[OrchestrationStepResult]) -> str:
+    if not step_results:
+        return "No orchestration steps were executed."
+    completed = sum(1 for step in step_results if step.success)
+    total = len(step_results)
+    lines = [
+        "Orchestration Summary",
+        "---------------------",
+        f"Executed {total} step(s). Completed: {completed}.",
+        "",
+        "Step Results",
+        "------------",
+    ]
+    for index, step in enumerate(step_results, start=1):
+        status = "Completed" if step.success else "Failed"
+        lines.append(f"{index}. {step.capability_label}: {status}")
+        lines.append(f"   Query: {step.query}")
+        first_line = (step.assistant_text or "").strip().splitlines()
+        if first_line:
+            lines.append(f"   Result: {first_line[0]}")
+    lines.extend(["", "Detailed Outputs", "----------------"])
+    for step in step_results:
+        lines.append(f"{step.capability_label}")
+        lines.append(step.assistant_text.strip() or "No output.")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _dedupe_sources_by_url(sources: list[dict[str, str]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for source in sources:
+        url = (source.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(source)
+    return out
+
+
+def _serialize_orchestration_step_result(step: OrchestrationStepResult) -> dict[str, object]:
+    return {
+        "action": step.action,
+        "tool_name": step.tool_name,
+        "query": step.query,
+        "success": step.success,
+        "reason": step.reason,
+        "capability_label": step.capability_label,
+        "source_count": len(step.sources),
+    }
+
+
+def _capability_label_for_action(action: str) -> str:
+    if action == "google_calendar":
+        return "Google Calendar"
+    if action == "google_gmail":
+        return "Gmail"
+    if action == "google_drive":
+        return "Google Drive"
+    if action == "web_search":
+        return "Web Search"
+    return action.replace("_", " ").title()
+
+
 def _should_force_verification_web_search(user_text: str, reasons: list[str]) -> bool:
     # Only force web search for genuinely high-risk factual requests.
     if "high_stakes" not in reasons:
@@ -1611,6 +2233,10 @@ def _looks_like_contextual_tool_followup(text: str) -> bool:
     if re.search(r"\bon\s+\d{1,2}(?:st|nd|rd|th)?\b", lowered):
         return True
     if re.search(r"\bon\s+\w+day\b", lowered):
+        return True
+    if re.search(r"\b(reschedule|move|shift|update|change)\b", lowered):
+        return True
+    if re.search(r"\b(that|this|it)\b.*\b(to|for)\b.*\b\d{1,2}(?::\d{2})?\s*(am|pm)\b", lowered):
         return True
     if re.match(
         r"^\s*(ok|okay|alright|cool|great|thanks|thank you|and|so)\b.*\b(check|look|show|again|now)\b",

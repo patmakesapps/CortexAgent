@@ -269,7 +269,17 @@ def _matches_explicit_calendar_write_intent(text: str) -> bool:
     if not text:
         return False
     if re.search(
-        r"\b(add|ad|create|schedule|book|set up|put)\b.*\b(my|the|this|that|it)\b.*\bcalendar\b",
+        r"\b(add|ad|create|schedule|book|set up|put|reschedule|move|shift|update|change)\b.*\b(my|the|this|that|it)\b.*\bcalendar\b",
+        text,
+    ):
+        return True
+    if re.search(
+        r"\b(reschedule|move|shift|update|change)\b.*\b(meeting|event|appointment)\b",
+        text,
+    ):
+        return True
+    if re.search(
+        r"\b(reschedule|move|shift|update|change)\b.*\b(that|this|it)\b.*\b(to|for)\b.*\b\d{1,2}(?::\d{2})?\s*(am|pm)\b",
         text,
     ):
         return True

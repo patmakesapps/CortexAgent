@@ -6,6 +6,7 @@ from cortexagent.tools.google_gmail import (
     GoogleGmailTool,
     _extract_new_email_fields,
     _extract_draft_id,
+    _is_read_message_intent,
     _is_send_new_email_intent,
     _sanitize_email_text,
 )
@@ -122,6 +123,47 @@ class GoogleGmailToolTests(unittest.TestCase):
             )
         self.assertEqual(result.items[0].title, "Message from thread t-1 | Hello")
         read_mock.assert_called_once()
+
+    def test_read_message_intent_detects_what_does_email_say(self):
+        self.assertTrue(_is_read_message_intent("what does the geisinger email say?"))
+
+    def test_read_message_selects_matching_thread_from_hint(self):
+        tool = GoogleGmailTool()
+        with patch.object(
+            tool,
+            "_list_recent_threads",
+            return_value=[
+                ToolResultItem(
+                    title="Thread aaaaaa1 | plaid",
+                    url="https://mail.google.com/mail/u/0/#inbox/aaaaaa1",
+                    snippet="From: Anya Hasija | Any thoughts on Plaid?",
+                ),
+                ToolResultItem(
+                    title="Thread bbbbbb2 | Application Developer: Geisinger - Application Developer I and more",
+                    url="https://mail.google.com/mail/u/0/#inbox/bbbbbb2",
+                    snippet="From: LinkedIn Job Alerts",
+                ),
+            ],
+        ), patch.object(
+            tool,
+            "_get_thread_metadata",
+            return_value={
+                "subject": "Application Developer: Geisinger - Application Developer I and more",
+                "from": "LinkedIn Job Alerts <jobalerts-noreply@linkedin.com>",
+                "body": "Role details here",
+                "snippet": "Role details here",
+            },
+        ) as metadata_mock:
+            result = tool.run(
+                ToolContext(
+                    thread_id="thread-1",
+                    user_text="what does the geisinger email say?",
+                    tool_meta={"access_token": "token-1"},
+                )
+            )
+        self.assertIn("Message from thread bbbbbb2", result.items[0].title)
+        self.assertIn("Role details here", result.items[0].snippet)
+        self.assertEqual(metadata_mock.call_args.kwargs.get("thread_id"), "bbbbbb2")
 
     def test_list_threads_defaults_to_primary_inbox_query(self):
         tool = GoogleGmailTool()

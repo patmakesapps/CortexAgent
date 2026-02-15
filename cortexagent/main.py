@@ -87,6 +87,7 @@ def agent_chat(
             response=result.response,
             decision=result.decision,
             sources=result.sources,
+            tool_pipeline=result.tool_pipeline,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
