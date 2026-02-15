@@ -27,7 +27,7 @@ class GoogleGmailTool(Tool):
     GMAIL_THREADS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/threads"
     GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
     GMAIL_DRAFTS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
-    GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+    GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send"
 
     def run(self, context: ToolContext) -> ToolResult:
         tool_meta = context.tool_meta or {}
@@ -358,7 +358,7 @@ class GoogleGmailTool(Tool):
         draft_details = self._get_draft(access_token=access_token, draft_id=draft_id)
         to_addr = draft_details.get("to") or ""
         _enforce_allowed_recipient_domains(to_addr=to_addr, allowed_domains=allowed_domains)
-        payload = {"draftId": draft_id}
+        payload = {"id": draft_id}
         sent = _api_request_json(
             url=self.GMAIL_SEND_URL,
             method="POST",
@@ -509,11 +509,20 @@ def _is_send_new_email_intent(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return False
-    return bool(
-        re.search(r"\bsend\b", lowered)
-        and re.search(r"\b(email|gmail|message)\b", lowered)
-        and re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", lowered)
-    )
+    if not _contains_email_address(lowered):
+        return False
+    if re.search(r"\b(send|sned|snd)\b", lowered):
+        return True
+    if re.search(r"\b(draft|compose|write)\b", lowered):
+        return False
+    # Support imperative phrasing like "email person@example.com and say ...".
+    if re.search(
+        r"\bemail\s+(?:to\s+)?[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b",
+        lowered,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
 
 
 def _is_compose_new_email_intent(text: str) -> bool:
@@ -522,8 +531,7 @@ def _is_compose_new_email_intent(text: str) -> bool:
         return False
     return bool(
         re.search(r"\b(draft|compose|write)\b", lowered)
-        and re.search(r"\b(email|gmail|message)\b", lowered)
-        and re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", lowered)
+        and _contains_email_address(lowered)
     )
 
 
@@ -583,16 +591,18 @@ def _extract_new_email_fields(text: str) -> tuple[str, str, str]:
         raise RuntimeError("Please include a recipient email address, e.g. 'to name@example.com'.")
 
     subject = _extract_subject_text(cleaned)
-    if not subject:
-        raise RuntimeError(
-            "Please include a subject, e.g. 'subject \"Hello\"' or 'subject: Hello'."
-        )
-
-    body = _extract_body_text(cleaned)
+    body = _extract_body_text(cleaned, known_subject=subject)
+    if not body:
+        body = _extract_freeform_body_text(cleaned, known_subject=subject)
+    body = _normalize_extracted_field(body, max_len=5000)
     if not body:
         raise RuntimeError(
-            "Please include a body, e.g. 'body \"Thanks for your time.\"' or 'body: ...'."
+            "Please tell me what the email should say, e.g. 'say \"Thanks for your time.\"'."
         )
+    subject = _normalize_extracted_field(subject, max_len=300)
+    if not subject:
+        subject = _infer_subject_text(cleaned, body)
+    subject = _normalize_extracted_field(subject, max_len=300) or "Quick note"
     return to_addr, subject, body
 
 
@@ -612,7 +622,7 @@ def _extract_subject_text(text: str) -> str:
     if not inline:
         return ""
     candidate = re.split(
-        r"\b(?:and\s+the\s+email\s+body|and\s+body|body(?:\s+can\s+say|\s+is)?)\b",
+        r"\b(?:and\s+the\s+email\s+body|and\s+body|body(?:\s+can\s+say|\s+is)?|message(?:\s+can\s+say|\s+is)?|say(?:ing)?)\b",
         inline.group(1),
         maxsplit=1,
         flags=re.IGNORECASE,
@@ -620,7 +630,7 @@ def _extract_subject_text(text: str) -> str:
     return candidate.strip(" -:;,.")
 
 
-def _extract_body_text(text: str) -> str:
+def _extract_body_text(text: str, known_subject: str = "") -> str:
     quoted = re.search(
         r"\b(?:email\s+)?body(?:\s+can\s+say|\s+should\s+say|\s+is)?\s*[:=\-]?\s*\"([^\"]{1,5000})\"",
         text,
@@ -642,7 +652,159 @@ def _extract_body_text(text: str) -> str:
     )
     if message_line:
         return message_line.group(1).strip().strip('"')
+    spoken_quoted = re.search(
+        r"\b(?:say|saying)\s*[:=\-]?\s*\"([^\"]{1,5000})\"",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if spoken_quoted:
+        return spoken_quoted.group(1).strip()
+    spoken_inline = re.search(
+        r"\b(?:say|saying)\s*[:=\-]?\s*(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if spoken_inline:
+        candidate = re.split(
+            r"\bsubject(?:\s+to\s+be|\s+is)?\b",
+            spoken_inline.group(1),
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        return candidate.strip().strip('"')
+    quoted_chunks = re.findall(r"\"([^\"]{1,5000})\"", text, flags=re.DOTALL)
+    for chunk in quoted_chunks:
+        candidate = chunk.strip()
+        if not candidate:
+            continue
+        if known_subject and candidate.lower() == known_subject.strip().lower():
+            continue
+        return candidate
     return ""
+
+
+def _extract_freeform_body_text(text: str, known_subject: str) -> str:
+    colon_style = re.search(
+        r"\b(?:send|sned|snd|draft|compose|write)\b[^:\n]{0,220}:\s*(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if colon_style:
+        candidate = colon_style.group(1).strip().strip('"')
+        if not _looks_like_non_body_fragment(candidate, known_subject):
+            return candidate
+
+    candidate = text
+    candidate = re.sub(
+        r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
+        " ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"\bsubject(?:\s+to\s+be|\s+is)?\s*[:=\-]?\s*\"[^\"]{0,300}\"",
+        " ",
+        candidate,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    candidate = re.sub(
+        r"\bsubject(?:\s+to\s+be|\s+is)?\s*[:=\-]?\s*([^\n|]{1,300})",
+        " ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"\b(?:please|can you|could you|would you|i need you to)\b",
+        " ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r"\b(?:send|sned|snd|draft|compose|write)\b", " ", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(
+        r"\b(?:an?\s+)?(?:email|gmail|message)\b",
+        " ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r"\b(?:to|for|with|and)\b", " ", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" \t\r\n\"'.,;:-")
+    if _looks_like_non_body_fragment(candidate, known_subject):
+        return ""
+    return candidate
+
+
+def _infer_subject_text(text: str, body: str) -> str:
+    hint = _extract_subject_hint_text(text)
+    if hint:
+        return hint
+    from_body = _infer_subject_from_body(body)
+    if from_body:
+        return from_body
+    return "Quick note"
+
+
+def _extract_subject_hint_text(text: str) -> str:
+    quoted = re.search(
+        r"\b(?:about|regarding|re)\s*[:=\-]?\s*\"([^\"]{1,300})\"",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if quoted:
+        return quoted.group(1).strip()
+    inline = re.search(
+        r"\b(?:about|regarding|re)\s+(.+?)(?=\b(?:say|saying|body|message|subject)\b|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not inline:
+        return ""
+    return _normalize_extracted_field(inline.group(1), max_len=300)
+
+
+def _infer_subject_from_body(body: str) -> str:
+    cleaned = _normalize_extracted_field(body, max_len=300)
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    if not words:
+        return ""
+    if len(words) <= 8:
+        return cleaned
+    return " ".join(words[:8]).strip(" -:;,.")
+
+
+def _normalize_extracted_field(value: str, max_len: int) -> str:
+    cleaned = re.sub(r"\s+", " ", (value or "")).strip().strip('"').strip()
+    cleaned = cleaned.strip(" -:;,.")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned
+
+
+def _looks_like_non_body_fragment(value: str, known_subject: str) -> bool:
+    cleaned = _normalize_extracted_field(value, max_len=5000).lower()
+    if not cleaned:
+        return True
+    if known_subject and cleaned == known_subject.strip().lower() and len(cleaned.split()) <= 6:
+        return True
+    if not re.search(r"[a-z0-9]", cleaned):
+        return True
+    if cleaned in {
+        "send",
+        "sned",
+        "snd",
+        "email",
+        "gmail",
+        "message",
+        "draft",
+        "compose",
+        "write",
+        "to",
+        "for",
+        "with",
+    }:
+        return True
+    return False
 
 
 def _normalize_quote_chars(text: str) -> str:
@@ -774,6 +936,16 @@ def _extract_first_email(value: str) -> str:
     return match.group(1).strip().lower()
 
 
+def _contains_email_address(value: str) -> bool:
+    return bool(
+        re.search(
+            r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
+            (value or "").strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
 def _parse_allowed_domains(raw: object) -> set[str]:
     if not isinstance(raw, list):
         return set()
@@ -849,13 +1021,25 @@ def _api_request_json(
         with urlrequest.urlopen(req, timeout=timeout) as res:
             payload = json.loads(res.read().decode("utf-8"))
     except urlerror.HTTPError as exc:
+        error_detail = ""
+        try:
+            raw_error = exc.read().decode("utf-8", errors="replace")
+            parsed_error = json.loads(raw_error)
+            if isinstance(parsed_error, dict):
+                nested = parsed_error.get("error")
+                if isinstance(nested, dict):
+                    message = str(nested.get("message") or "").strip()
+                    if message:
+                        error_detail = f": {message}"
+        except Exception:
+            error_detail = ""
         if exc.code in {401, 403}:
             raise RuntimeError(
                 f"{service_name} authorization failed. Please reconnect Google."
             )
         if exc.code == 404:
             raise RuntimeError(f"{service_name} could not find the requested resource.")
-        raise RuntimeError(f"{service_name} API failed ({exc.code}).")
+        raise RuntimeError(f"{service_name} API failed ({exc.code}){error_detail}.")
     except Exception as exc:
         raise RuntimeError(f"{service_name} API failed: {exc}")
     if not isinstance(payload, dict):
