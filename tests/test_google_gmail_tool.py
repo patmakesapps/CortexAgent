@@ -201,7 +201,7 @@ class GoogleGmailToolTests(unittest.TestCase):
                 ToolResultItem(
                     title="Thread aaaaaa1 | plaid",
                     url="https://mail.google.com/mail/u/0/#inbox/aaaaaa1",
-                    snippet="From: Anya Hasija | Any thoughts on Plaid?",
+                    snippet="From: Person G | Any thoughts on CompanyY?",
                 ),
                 ToolResultItem(
                     title="Thread bbbbbb2 | Application Developer: Geisinger - Application Developer I and more",
@@ -360,19 +360,19 @@ class GoogleGmailToolTests(unittest.TestCase):
             return_value=(
                 "recipient@example.com",
                 "Meeting agenda",
-                "Hi Rob, I am available to film the video for $4,000. Thanks.",
+                "Hi Person A, I am available to film the video for $4,000. Thanks.",
             ),
         ) as llm_mock:
             to_addr, subject, body = _extract_new_email_fields(
                 "send an email to recipient@example.com and in the email make the subject "
                 "\"Meeting agenda\" then compose the body stating i am available to film the video "
-                "for $4,000. Then add to my calendar meeting with Rob."
+                "for $4,000. Then add to my calendar meeting with Person A."
             )
 
         self.assertEqual(to_addr, "recipient@example.com")
         self.assertEqual(subject, "Meeting agenda")
         self.assertEqual(
-            body, "Hi Rob, I am available to film the video for $4,000. Thanks"
+            body, "Hi Person A, I am available to film the video for $4,000. Thanks"
         )
         llm_mock.assert_called_once()
 

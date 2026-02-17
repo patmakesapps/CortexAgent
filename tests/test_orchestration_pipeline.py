@@ -46,9 +46,9 @@ class _FakeGoogleGmailTool(Tool):
             query=context.user_text,
             items=[
                 ToolResultItem(
-                    title="Any thoughts on Plaid?",
+                    title="Any thoughts on CompanyY?",
                     url="https://mail.google.com/mail/u/0/#inbox/fake-thread",
-                    snippet="From: Anya Hasija <ahasija@plaid.com>",
+                    snippet="From: Person G <ahasija@plaid.com>",
                 )
             ],
         )
@@ -67,7 +67,7 @@ class _FakeGoogleDriveTool(Tool):
             query=context.user_text,
             items=[
                 ToolResultItem(
-                    title="Plaid interview prep doc",
+                    title="CompanyY interview prep doc",
                     url="https://drive.google.com/file/d/fake-doc/view",
                     snippet="Owner: Me | Updated: Today",
                 )
@@ -88,7 +88,7 @@ class _FakeGoogleCalendarTool(Tool):
             query=context.user_text,
             items=[
                 ToolResultItem(
-                    title="[Created] Plaid follow-up",
+                    title="[Created] CompanyY follow-up",
                     url="https://calendar.google.com/calendar/event?eid=fake-eid-1",
                     snippet="Created event | Starts: Tue, Feb 17 at 3:00 PM",
                 )
@@ -257,7 +257,7 @@ class _FakePendingThenConfirmCalendarTool(Tool):
                 query=query,
                 items=[
                     ToolResultItem(
-                        title="[Created] Meeting with Rob",
+                        title="[Created] Meeting with Person A",
                         url="https://calendar.google.com/calendar/event?eid=created-1",
                         snippet="Created event | Starts: Mon, Mar 2 at 1:00 PM | Philadelphia",
                     )
@@ -272,7 +272,7 @@ class _FakePendingThenConfirmCalendarTool(Tool):
                     url="https://calendar.google.com/",
                     snippet=(
                         "I have this draft event:\n"
-                        "- Title: Meeting with Rob\n"
+                        "- Title: Meeting with Person A\n"
                         "- Day: March 2nd\n"
                         "- Time: 1:00 PM\n"
                         "- Location: Philadelphia\n"
@@ -625,7 +625,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
                 text=(
                     "send an email to recipient@example.com and in the email make the subject "
                     "\"Meeting agenda\" then compose the body stating i am available to film the video "
-                    "for $4,000. Then add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia"
+                    "for $4,000. Then add to my calendar Meeting with Person A on March 2nd at 1pm in Philadelphia"
                 ),
                 short_term_limit=30,
                 authorization="Bearer token",
@@ -685,7 +685,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
                 text=(
                     "send an email to recipient@example.com and in the email make the subject "
                     "\"Meeting agenda\" then compose the body stating i am available to film the video "
-                    "for $4,000. Then add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia"
+                    "for $4,000. Then add to my calendar Meeting with Person A on March 2nd at 1pm in Philadelphia"
                 ),
                 short_term_limit=30,
                 authorization="Bearer token",
@@ -745,7 +745,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
                 text=(
                     "send an email to recipient@example.com and in the email make the subject "
                     "\"Meeting agenda\" then compose the body stating i am available to film the video "
-                    "for $4,000. Then add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia"
+                    "for $4,000. Then add to my calendar Meeting with Person A on March 2nd at 1pm in Philadelphia"
                 ),
                 short_term_limit=30,
                 authorization="Bearer token",
@@ -800,7 +800,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
         ):
             first = orchestrator.handle_chat(
                 thread_id="thread-ambiguous",
-                text="add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia",
+                text="add to my calendar Meeting with Person A on March 2nd at 1pm in Philadelphia",
                 short_term_limit=30,
                 authorization="Bearer token",
             )

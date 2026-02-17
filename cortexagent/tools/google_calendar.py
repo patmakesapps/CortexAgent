@@ -19,6 +19,9 @@ class GoogleCalendarTool(Tool):
 
     def run(self, context: ToolContext) -> ToolResult:
         tool_meta = context.tool_meta or {}
+        operation = str(tool_meta.get("operation") or "").strip().lower()
+        raw_args = tool_meta.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
         access_token = tool_meta.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
             raise RuntimeError("Google account is not connected. Please connect Google first.")
@@ -32,9 +35,21 @@ class GoogleCalendarTool(Tool):
 
         token = access_token.strip()
         items: list[ToolResultItem] = []
+        if operation in {"create", "write"}:
+            explicit_text = str(args.get("event_text") or "").strip()
+            event_text = explicit_text or context.user_text.strip()
+            if not event_text:
+                raise RuntimeError("Missing event_text for calendar write operation.")
+            created_item = self._quick_add_event(
+                access_token=token,
+                event_text=event_text,
+            )
+            items.append(created_item)
+            max_results = max(0, max_results - 1)
+
         is_create_intent = _is_create_intent(context.user_text)
         has_confirmation = _has_explicit_write_confirmation(context.user_text)
-        if is_create_intent or has_confirmation:
+        if not items and (is_create_intent or has_confirmation):
             if not has_confirmation:
                 return ToolResult(
                     tool_name=self.name,

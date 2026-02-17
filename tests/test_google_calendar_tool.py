@@ -30,7 +30,7 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
         )
         self.assertEqual(result.items[0].title, "Confirmation required")
         self.assertIn("Should I add this to Google Calendar?", result.items[0].snippet)
-        self.assertIn("Meeting with Dan Bakeman", result.items[0].snippet)
+        self.assertIn("Meeting with Person E", result.items[0].snippet)
 
     def test_add_to_calendar_phrase_without_my_requires_confirmation(self):
         tool = GoogleCalendarTool()
@@ -103,7 +103,7 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
         )
         self.assertEqual(result.items[0].title, "Confirmation required")
         self.assertIn("- Time: 4:00 PM", result.items[0].snippet)
-        self.assertIn("- Title: Meeting with John From Coinbase", result.items[0].snippet)
+        self.assertIn("- Title: Meeting with John From CompanyX", result.items[0].snippet)
         self.assertNotIn("<event details>", result.items[0].snippet)
 
     def test_detects_typo_ad_it_to_calendar_phrasing(self):
@@ -167,7 +167,7 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
                 ToolContext(
                     thread_id="thread-1",
                     user_text=(
-                        "confirm: add event Meeting with My Wife Tonight on Saturday, Feb 14, 2026 "
+                        "confirm: add event Meeting with Person F Tonight on Saturday, Feb 14, 2026 "
                         "at 8:00PM in Wild Rabbit"
                     ),
                     tool_meta={"access_token": "token-1"},
@@ -175,7 +175,7 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
             )
         self.assertEqual(
             quick_add_mock.call_args.kwargs["event_text"],
-            "Meeting with My Wife Tonight on Saturday, Feb 14, 2026 at 8:00PM in Wild Rabbit",
+            "Meeting with Person F Tonight on Saturday, Feb 14, 2026 at 8:00PM in Wild Rabbit",
         )
 
     def test_confirmed_draft_text_without_add_keyword_executes_write(self):
@@ -184,7 +184,7 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
             tool,
             "_quick_add_event",
             return_value=ToolResultItem(
-                title="[Created] Meeting with Jim",
+                title="[Created] Meeting with Person B",
                 url="https://calendar.google.com/",
                 snippet="Created event | Starts: Sat, Feb 14 at 08:00 PM",
             ),
@@ -197,13 +197,13 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
                 ToolContext(
                     thread_id="thread-1",
                     user_text=(
-                        "confirm: Meeting with Jim on Saturday, Feb 14, 2026 at 8:00PM in Wild Rabbit"
+                        "confirm: Meeting with Person B on Saturday, Feb 14, 2026 at 8:00PM in Wild Rabbit"
                     ),
                     tool_meta={"access_token": "token-1"},
                 )
             )
 
-        self.assertEqual(result.items[0].title, "[Created] Meeting with Jim")
+        self.assertEqual(result.items[0].title, "[Created] Meeting with Person B")
         quick_add_mock.assert_called_once()
         list_mock.assert_called_once()
 

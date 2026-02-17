@@ -49,7 +49,10 @@ class Settings:
     web_search_retries: int
     groq_api_key: str | None
     router_llm_enabled: bool
+    router_llm_provider: str
     router_llm_model: str
+    router_llm_api_base_url: str | None
+    router_llm_api_key: str | None
     router_llm_timeout_seconds: int
     planner_llm_enabled: bool
     planner_llm_provider: str
@@ -100,7 +103,14 @@ def load_settings() -> Settings:
         web_search_retries=_as_int(os.getenv("WEB_SEARCH_RETRIES"), 2),
         groq_api_key=(os.getenv("GROQ_API_KEY") or None),
         router_llm_enabled=_as_bool(os.getenv("AGENT_ROUTER_LLM_ENABLED"), True),
+        router_llm_provider=os.getenv("AGENT_ROUTER_LLM_PROVIDER", "groq").strip().lower(),
         router_llm_model=router_model,
+        router_llm_api_base_url=(os.getenv("AGENT_ROUTER_LLM_API_BASE_URL") or None),
+        router_llm_api_key=(
+            os.getenv("AGENT_ROUTER_LLM_API_KEY")
+            or os.getenv("GROQ_API_KEY")
+            or None
+        ),
         router_llm_timeout_seconds=_as_int(
             os.getenv("AGENT_ROUTER_LLM_TIMEOUT_SECONDS"), 6
         ),

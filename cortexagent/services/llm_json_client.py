@@ -99,7 +99,10 @@ def call_json_chat_completion(
 
 def _resolve_chat_endpoint(provider: str, api_base_url: str | None) -> str | None:
     if provider == "groq":
-        return "https://api.groq.com/openai/v1/chat/completions"
+        base = (api_base_url or "https://api.groq.com/openai/v1").strip()
+        if not base:
+            return None
+        return f"{base.rstrip('/')}/chat/completions"
     if provider in {"openai", "openai_compatible"}:
         base = (api_base_url or "https://api.openai.com/v1").strip()
         if not base:

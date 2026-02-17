@@ -101,7 +101,7 @@ class _FakeConfirmingGoogleCalendarTool(Tool):
                     title="Confirmation required",
                     url="https://calendar.google.com/",
                     snippet=(
-                        "I have this draft event:\n- Title: Meeting with Jerry\n"
+                        "I have this draft event:\n- Title: Meeting with Person D\n"
                         "- Day: Wednesday, Feb 18, 2026\n- Time: 11:00 AM\n"
                         "Should I add this to Google Calendar? "
                         "Reply with 'confirm' to proceed or 'cancel' to stop."
@@ -126,7 +126,7 @@ class _CapturingConfirmingGoogleCalendarTool(Tool):
                 query=text,
                 items=[
                     ToolResultItem(
-                        title="[Created] Meeting with John From Coinbase",
+                        title="[Created] Meeting with John From CompanyX",
                         url="https://calendar.google.com/calendar/event?eid=test-created-2",
                         snippet="Created event | Starts: Wed, Feb 18 at 11:00 AM | Philly",
                     )
@@ -141,7 +141,7 @@ class _CapturingConfirmingGoogleCalendarTool(Tool):
                     url="https://calendar.google.com/",
                     snippet=(
                         "I have this draft event:\n"
-                        "- Title: Meeting with John From Coinbase\n"
+                        "- Title: Meeting with John From CompanyX\n"
                         "- Day: Wednesday, Feb 18, 2026\n"
                         "- Time: 11:00 AM\n"
                         "- Location: Philly\n"
@@ -164,7 +164,7 @@ class _FakeEditableCalendarTool(Tool):
                 query=context.user_text,
                 items=[
                     ToolResultItem(
-                        title="[Created] Meeting with Jim",
+                        title="[Created] Meeting with Person B",
                         url="https://calendar.google.com/calendar/event?eid=created-jim-1",
                         snippet="Created event | Starts: Sat, Feb 14 at 06:00 PM",
                     )
@@ -185,7 +185,7 @@ class _FakeEditableCalendarTool(Tool):
                         url="https://calendar.google.com/",
                         snippet=(
                             "I have this draft event:\n"
-                            "- Title: Meeting with Jim\n"
+                            "- Title: Meeting with Person B\n"
                             f"- Day: {day}\n"
                             "- Time: 6:00 PM\n"
                             "Should I add this to Google Calendar? "
@@ -838,7 +838,7 @@ class GoogleCalendarFlowTests(unittest.TestCase):
     def test_build_confirmed_request_expands_plain_confirm_with_explicit_fields(self):
         draft = (
             "I have this draft event:\n"
-            "- Title: Meeting with John From Coinbase\n"
+            "- Title: Meeting with John From CompanyX\n"
             "- Day: Wednesday, Feb 18, 2026\n"
             "- Time: 11:00 AM\n"
             "- Location: Philly\n"
@@ -847,7 +847,7 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         )
         merged = _build_confirmed_calendar_request(draft_text=draft, followup_text="confirm")
         self.assertTrue(merged.lower().startswith("confirm: add event "))
-        self.assertIn("Meeting with John From Coinbase", merged)
+        self.assertIn("Meeting with John From CompanyX", merged)
         self.assertIn("on Wednesday, Feb 18, 2026", merged)
         self.assertIn("at 11:00AM", merged)
         self.assertIn("in Philly", merged)
@@ -927,7 +927,7 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         ):
             first = orchestrator.handle_chat(
                 thread_id="thread-1",
-                text="add meeting with Jim tonight at 6pm to my calendar",
+                text="add meeting with Person B tonight at 6pm to my calendar",
                 short_term_limit=30,
                 authorization="Bearer token",
             )

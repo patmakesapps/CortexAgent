@@ -113,7 +113,21 @@ def classify_confirmation_intent_deterministic(
         )
 
     if pending_calendar and (
-        token_set.intersection({"edit", "change", "update", "move", "shift", "instead"})
+        token_set.intersection(
+            {
+                "edit",
+                "change",
+                "update",
+                "move",
+                "shift",
+                "instead",
+                "location",
+                "title",
+                "time",
+                "date",
+                "day",
+            }
+        )
         or token_set.intersection(_DAY_TOKENS)
         or any(_looks_like_time_token(token) for token in tokens)
     ):

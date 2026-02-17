@@ -34,6 +34,9 @@ class GoogleGmailTool(Tool):
 
     def run(self, context: ToolContext) -> ToolResult:
         tool_meta = context.tool_meta or {}
+        operation = str(tool_meta.get("operation") or "").strip().lower()
+        raw_args = tool_meta.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
         access_token = tool_meta.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
             raise RuntimeError("Google account is not connected. Please connect Google first.")
@@ -46,6 +49,17 @@ class GoogleGmailTool(Tool):
 
         allowed_domains = _parse_allowed_domains(tool_meta.get("allowed_recipient_domains"))
         parsed_new_email: tuple[str, str, str, bool] | None = None
+
+        if operation == "send":
+            draft_id = str(args.get("draft_id") or "").strip()
+            if not draft_id:
+                raise RuntimeError("Missing draft_id for Gmail send operation.")
+            sent = self._send_message(
+                access_token=token,
+                user_text=f"send draft {draft_id}",
+                allowed_domains=allowed_domains,
+            )
+            return ToolResult(tool_name=self.name, query=user_text, items=[sent])
 
         if _is_send_intent(user_text):
             if not _has_explicit_send_confirmation(user_text):
