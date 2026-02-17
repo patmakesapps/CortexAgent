@@ -32,6 +32,21 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
         self.assertIn("Should I add this to Google Calendar?", result.items[0].snippet)
         self.assertIn("Meeting with Dan Bakeman", result.items[0].snippet)
 
+    def test_add_to_calendar_phrase_without_my_requires_confirmation(self):
+        tool = GoogleCalendarTool()
+        result = tool.run(
+            ToolContext(
+                thread_id="thread-1",
+                user_text=(
+                    "i need you to add to calendar Saturday at 9am in Dillsburg "
+                    "video shoot with Anthony"
+                ),
+                tool_meta={"access_token": "token-1"},
+            )
+        )
+        self.assertEqual(result.items[0].title, "Confirmation required")
+        self.assertIn("Should I add this to Google Calendar?", result.items[0].snippet)
+
     def test_missing_date_and_time_adds_future_day_assumption(self):
         tool = GoogleCalendarTool()
         result = tool.run(
@@ -201,7 +216,7 @@ class GoogleCalendarToolWriteConfirmationTests(unittest.TestCase):
                 ToolContext(
                     thread_id="thread-1",
                     user_text=(
-                        "send an email to purpleparkstudios@gmail.com and confirm the meeting "
+                        "send an email to recipient@example.com and confirm the meeting "
                         "at 6pm on monday. add it to my calendar"
                     ),
                     tool_meta={"access_token": "token-1"},

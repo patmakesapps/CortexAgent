@@ -19,7 +19,9 @@ DEFAULT_USER_AGENT = (
 class WebSearchProvider:
     name = "unknown"
 
-    def search(self, query: str, max_results: int, timeout_seconds: int) -> list[ToolResultItem]:
+    def search(
+        self, query: str, max_results: int, timeout_seconds: int
+    ) -> list[ToolResultItem]:
         raise NotImplementedError
 
 
@@ -30,7 +32,9 @@ class BraveSearchProvider(WebSearchProvider):
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
 
-    def search(self, query: str, max_results: int, timeout_seconds: int) -> list[ToolResultItem]:
+    def search(
+        self, query: str, max_results: int, timeout_seconds: int
+    ) -> list[ToolResultItem]:
         headers = {
             "Accept": "application/json",
             "X-Subscription-Token": self.api_key,
@@ -68,7 +72,9 @@ class DuckDuckGoProvider(WebSearchProvider):
     HTML_SEARCH_URL = "https://html.duckduckgo.com/html/"
     LITE_SEARCH_URL = "https://lite.duckduckgo.com/lite/"
 
-    def search(self, query: str, max_results: int, timeout_seconds: int) -> list[ToolResultItem]:
+    def search(
+        self, query: str, max_results: int, timeout_seconds: int
+    ) -> list[ToolResultItem]:
         items: list[ToolResultItem] = []
         seen_urls: set[str] = set()
         cap = max(1, max_results)
@@ -81,12 +87,16 @@ class DuckDuckGoProvider(WebSearchProvider):
         if len(items) >= cap:
             return items[:cap]
 
-        html_items = self._html_search(query=query, max_results=cap, timeout_seconds=timeout_seconds)
+        html_items = self._html_search(
+            query=query, max_results=cap, timeout_seconds=timeout_seconds
+        )
         _append_unique_items(html_items, items, seen_urls, cap)
         if len(items) >= cap:
             return items[:cap]
 
-        lite_items = self._lite_search(query=query, max_results=cap, timeout_seconds=timeout_seconds)
+        lite_items = self._lite_search(
+            query=query, max_results=cap, timeout_seconds=timeout_seconds
+        )
         _append_unique_items(lite_items, items, seen_urls, cap)
         return items[:cap]
 
@@ -102,7 +112,10 @@ class DuckDuckGoProvider(WebSearchProvider):
         url = f"{self.SEARCH_URL}?{urlparse.urlencode(params)}"
         req = urlrequest.Request(
             url,
-            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.8"},
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.8",
+            },
             method="GET",
         )
         try:
@@ -119,7 +132,11 @@ class DuckDuckGoProvider(WebSearchProvider):
         heading = _clean_html((payload.get("Heading") or query).strip())
 
         if abstract_text and abstract_url:
-            items.append(ToolResultItem(title=heading or query, url=abstract_url, snippet=abstract_text))
+            items.append(
+                ToolResultItem(
+                    title=heading or query, url=abstract_url, snippet=abstract_text
+                )
+            )
 
         related = payload.get("RelatedTopics") or []
         for topic in _iter_duck_related_topics(related):
@@ -141,7 +158,10 @@ class DuckDuckGoProvider(WebSearchProvider):
         url = f"{self.HTML_SEARCH_URL}?{urlparse.urlencode(params)}"
         req = urlrequest.Request(
             url,
-            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.8"},
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.8",
+            },
             method="GET",
         )
         try:
@@ -177,8 +197,14 @@ class DuckDuckGoProvider(WebSearchProvider):
             normalized_url = _normalize_http_url(url)
             if not normalized_url:
                 continue
-            snippet = _clean_html(snippet_matches[idx]) if idx < len(snippet_matches) else ""
-            items.append(ToolResultItem(title=title, url=normalized_url, snippet=snippet or title))
+            snippet = (
+                _clean_html(snippet_matches[idx]) if idx < len(snippet_matches) else ""
+            )
+            items.append(
+                ToolResultItem(
+                    title=title, url=normalized_url, snippet=snippet or title
+                )
+            )
 
         return items
 
@@ -189,7 +215,10 @@ class DuckDuckGoProvider(WebSearchProvider):
         url = f"{self.LITE_SEARCH_URL}?{urlparse.urlencode(params)}"
         req = urlrequest.Request(
             url,
-            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.8"},
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.8",
+            },
             method="GET",
         )
         try:
@@ -225,8 +254,14 @@ class DuckDuckGoProvider(WebSearchProvider):
             normalized_url = _normalize_http_url(url)
             if not normalized_url:
                 continue
-            snippet = _clean_html(snippet_matches[idx]) if idx < len(snippet_matches) else ""
-            items.append(ToolResultItem(title=title, url=normalized_url, snippet=snippet or title))
+            snippet = (
+                _clean_html(snippet_matches[idx]) if idx < len(snippet_matches) else ""
+            )
+            items.append(
+                ToolResultItem(
+                    title=title, url=normalized_url, snippet=snippet or title
+                )
+            )
         return items
 
 
@@ -234,12 +269,17 @@ class BingHtmlProvider(WebSearchProvider):
     name = "bing"
     SEARCH_URL = "https://www.bing.com/search"
 
-    def search(self, query: str, max_results: int, timeout_seconds: int) -> list[ToolResultItem]:
+    def search(
+        self, query: str, max_results: int, timeout_seconds: int
+    ) -> list[ToolResultItem]:
         params = {"q": query, "setlang": "en-us", "ensearch": "1"}
         url = f"{self.SEARCH_URL}?{urlparse.urlencode(params)}"
         req = urlrequest.Request(
             url,
-            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.8"},
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.8",
+            },
             method="GET",
         )
         try:
@@ -276,9 +316,15 @@ class BingHtmlProvider(WebSearchProvider):
             if not normalized_url:
                 continue
 
-            snippet_match = re.search(r"<p[^>]*>(.*?)</p>", block, flags=re.IGNORECASE | re.DOTALL)
+            snippet_match = re.search(
+                r"<p[^>]*>(.*?)</p>", block, flags=re.IGNORECASE | re.DOTALL
+            )
             snippet = _clean_html(snippet_match.group(1)) if snippet_match else ""
-            items.append(ToolResultItem(title=title, url=normalized_url, snippet=snippet or title))
+            items.append(
+                ToolResultItem(
+                    title=title, url=normalized_url, snippet=snippet or title
+                )
+            )
 
         return items
 
@@ -385,7 +431,9 @@ def _append_unique_items(
             ToolResultItem(
                 title=_clean_html(item.title) or normalized_url,
                 url=normalized_url,
-                snippet=_clean_html(item.snippet) or _clean_html(item.title) or normalized_url,
+                snippet=_clean_html(item.snippet)
+                or _clean_html(item.title)
+                or normalized_url,
             )
         )
 
@@ -507,11 +555,7 @@ def _decode_tracking_target(value: str) -> str | None:
 def _build_provider_chain(
     configured: str, brave_key: str | None
 ) -> list[WebSearchProvider]:
-    tokens = [
-        token.strip().lower()
-        for token in configured.split(",")
-        if token.strip()
-    ]
+    tokens = [token.strip().lower() for token in configured.split(",") if token.strip()]
     if not tokens:
         tokens = ["duckduckgo", "bing"]
 

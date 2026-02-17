@@ -11,6 +11,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from cortexagent.config import settings
+from cortexagent.services.llm_json_client import call_json_chat_completion
 
 from .base import Tool, ToolContext, ToolResult, ToolResultItem
 
@@ -208,15 +209,25 @@ class GoogleGmailTool(Tool):
     def _draft_reply(self, access_token: str, user_text: str) -> ToolResultItem:
         thread_id = _extract_thread_id(user_text)
         if not thread_id:
+            candidate_threads = self._list_recent_threads(
+                access_token=access_token,
+                max_results=8,
+                inbox_query=_build_inbox_query(user_text),
+            )
+            thread_id = _select_thread_id_for_reply_intent(
+                user_text=user_text,
+                candidates=candidate_threads,
+            )
+        if not thread_id:
             raise RuntimeError(
-                "Please include a Gmail thread id to draft a reply. Example: "
-                "'draft reply to thread 189abc: Thanks, I can do 3 PM.'"
+                "I couldn't identify which email to reply to. "
+                "Please reference the sender or include the Gmail thread id."
             )
         body = _extract_reply_body(user_text)
         if not body:
             raise RuntimeError(
-                "Please include the reply body after a colon. Example: "
-                "'draft reply to thread 189abc: Thanks, that works for me.'"
+                "Please include what you want to say in the reply. "
+                "Example: 'reply to the sender and let them know I appreciate the note.'"
             )
         details = self._get_thread_metadata(
             access_token=access_token,
@@ -535,6 +546,8 @@ def _is_read_message_intent(text: str) -> bool:
 
 def _is_draft_reply_intent(text: str) -> bool:
     lowered = text.strip().lower()
+    if re.search(r"\breply\s+to\b", lowered):
+        return True
     return bool(
         re.search(r"\b(draft|compose|write)\b", lowered)
         and re.search(r"\b(reply|response|email)\b", lowered)
@@ -637,6 +650,80 @@ def _select_thread_id_for_read_intent(
     return best_thread
 
 
+def _select_thread_id_for_reply_intent(
+    user_text: str,
+    candidates: list[ToolResultItem],
+) -> str | None:
+    hint = _extract_reply_target_hint(user_text)
+    if not hint:
+        return _select_thread_id_for_read_intent(user_text=user_text, candidates=candidates)
+    lowered_hint = hint.lower()
+    for item in candidates:
+        haystack = f"{item.title} {item.snippet}".lower()
+        if lowered_hint in haystack:
+            thread_id = _extract_thread_id(item.title)
+            if thread_id:
+                return thread_id
+    hint_tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", lowered_hint)
+        if len(token) >= 2
+        and token
+        not in {
+            "the",
+            "this",
+            "that",
+            "from",
+            "with",
+            "email",
+            "message",
+            "thread",
+            "reply",
+            "to",
+            "and",
+            "about",
+        }
+    ]
+    if not hint_tokens:
+        return _select_thread_id_for_read_intent(user_text=user_text, candidates=candidates)
+    best_thread: str | None = None
+    best_score = 0
+    for item in candidates:
+        haystack = f"{item.title} {item.snippet}".lower()
+        score = sum(1 for token in hint_tokens if token in haystack)
+        if score > best_score:
+            thread_id = _extract_thread_id(item.title)
+            if thread_id:
+                best_thread = thread_id
+                best_score = score
+    if best_thread:
+        return best_thread
+    return _select_thread_id_for_read_intent(user_text=user_text, candidates=candidates)
+
+
+def _extract_reply_target_hint(user_text: str) -> str:
+    lowered = re.sub(r"\s+", " ", (user_text or "").strip().lower())
+    if not lowered:
+        return ""
+    patterns = [
+        r"\breply\s+to\s+(.+?)\s+\band\b",
+        r"\breply\s+to\s+(.+?)\s+\blet\b",
+        r"\breply\s+to\s+(.+?)\s+\btell\b",
+        r"\breply\s+to\s+(.+?)\s*$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        candidate = re.sub(r"\b(the|this|that)\b", " ", candidate)
+        candidate = re.sub(r"\b(email|message|thread|latest)\b", " ", candidate)
+        candidate = re.sub(r"\s+", " ", candidate).strip(" .,!?:;")
+        if candidate:
+            return candidate
+    return ""
+
+
 def _extract_read_target_hint(user_text: str) -> str:
     lowered = re.sub(r"\s+", " ", (user_text or "").strip().lower())
     if not lowered:
@@ -678,10 +765,54 @@ def _extract_draft_id(text: str) -> str | None:
 
 
 def _extract_reply_body(text: str) -> str:
-    parts = text.split(":", 1)
-    if len(parts) < 2:
-        return ""
-    return parts[1].strip()
+    cleaned = _normalize_quote_chars(text or "")
+    parts = cleaned.split(":", 1)
+    if len(parts) >= 2:
+        candidate = _normalize_extracted_field(
+            _trim_non_email_followup_fragments(parts[1]),
+            max_len=5000,
+        )
+        if candidate:
+            return candidate
+
+    patterns = [
+        r"\blet\s+(?:him|her|them)\s+know(?:\s+that)?\s+(.+)$",
+        r"\btell\s+(?:him|her|them)\s+that\s+(.+)$",
+        r"\btell\s+(?:him|her|them)\s+(.+)$",
+        r"\bsay(?:ing)?\s+(.+)$",
+        r"\breply\s+to\s+.+?\s+\b(?:and|about)\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        candidate = _normalize_extracted_field(
+            _trim_non_email_followup_fragments(match.group(1)),
+            max_len=5000,
+        )
+        if candidate:
+            return candidate
+
+    fallback = re.sub(
+        r"^\s*(?:can you|could you|would you|please)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    fallback = re.sub(
+        r"^\s*reply\s+to\s+.+?\b(?:and|about)\b",
+        "",
+        fallback,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    fallback_candidate = _normalize_extracted_field(
+        _trim_non_email_followup_fragments(fallback),
+        max_len=5000,
+    )
+    if fallback_candidate:
+        return fallback_candidate
+
+    return ""
 
 
 def _extract_new_email_fields(text: str) -> tuple[str, str, str]:
@@ -701,36 +832,46 @@ def _extract_new_email_fields_detailed(text: str) -> tuple[str, str, str, bool]:
         body = _extract_freeform_body_text(cleaned, known_subject=subject)
     body = _trim_non_email_followup_fragments(body)
     body = _normalize_extracted_field(body, max_len=5000)
-    if not body:
-        raise RuntimeError(
-            "Please tell me what the email should say, e.g. 'say \"Thanks for your time.\"'."
-        )
     subject = _normalize_extracted_field(subject, max_len=300)
     if not subject:
         subject = _infer_subject_text(cleaned, body)
     subject = _normalize_extracted_field(subject, max_len=300) or "Quick note"
 
     llm_used = False
-    should_use_composer = _should_use_llm_email_composer(cleaned, subject=subject, body=body)
-    if should_use_composer:
-        llm_result = _llm_compose_email_fields(
-            user_text=cleaned,
-            fallback_to=to_addr,
-            fallback_subject=subject,
-            fallback_body=body,
+    # Intent-based composition path: always try LLM planner/composer first.
+    llm_result = _llm_compose_email_fields(
+        user_text=cleaned,
+        fallback_to=to_addr,
+        fallback_subject=subject,
+        fallback_body=body,
+    )
+    if llm_result is None:
+        raise RuntimeError(
+            "I could not compose this email from intent right now. "
+            "Please retry in a moment or provide explicit subject/body text."
         )
-        if llm_result is not None:
-            llm_to, llm_subject, llm_body = llm_result
-            to_addr = llm_to or to_addr
-            subject = _normalize_extracted_field(llm_subject, max_len=300) or subject
-            body = _normalize_extracted_field(llm_body, max_len=5000) or body
-            llm_used = True
-        else:
-            subject, body = _compose_email_fields_fallback(
-                user_text=cleaned,
-                fallback_subject=subject,
-                fallback_body=body,
-            )
+    llm_to, llm_subject, llm_body = llm_result
+    llm_body_normalized = _normalize_composed_email_body(
+        _normalize_extracted_field(llm_body, max_len=5000)
+    )
+    llm_subject_normalized = _normalize_extracted_field(llm_subject, max_len=300)
+    if _looks_like_low_quality_composed_body(llm_body_normalized):
+        raise RuntimeError(
+            "I couldn't confidently compose a clean email body from that intent. "
+            "Please restate what the email should say in one sentence."
+        )
+    to_addr = llm_to or to_addr
+    subject = llm_subject_normalized or subject
+    body = llm_body_normalized or body
+    llm_used = True
+
+    if not body:
+        raise RuntimeError(
+            "Please tell me what the email should say, e.g. 'say \"Thanks for your time.\"'."
+        )
+
+    body = _normalize_composed_email_body(body)
+    subject = _normalize_subject_for_send(subject=subject, body=body)
 
     if _looks_like_ambiguous_new_email_parse(body=body, subject=subject):
         raise RuntimeError(
@@ -744,9 +885,16 @@ def _should_use_llm_email_composer(text: str, subject: str, body: str) -> bool:
     lowered = (text or "").strip().lower()
     if not lowered:
         return False
+    _ = subject  # reserved for future subject-sensitivity routing
     explicit_compose_intent = bool(
         re.search(
             r"\b(compose|write|draft)\b.*\b(body|message|email)\b",
+            lowered,
+        )
+    )
+    instructional_intent = bool(
+        re.search(
+            r"\b(?:tell|let)\s+(?:him|her|them)\b",
             lowered,
         )
     )
@@ -758,7 +906,7 @@ def _should_use_llm_email_composer(text: str, subject: str, body: str) -> bool:
         or " compose the body" in lowered
         or " in the email make the subject" in lowered
     )
-    return explicit_compose_intent or body_quality_issue
+    return explicit_compose_intent or instructional_intent or body_quality_issue
 
 
 def _llm_compose_email_fields(
@@ -767,7 +915,8 @@ def _llm_compose_email_fields(
     fallback_subject: str,
     fallback_body: str,
 ) -> tuple[str, str, str] | None:
-    if not settings.groq_api_key:
+    api_key = settings.planner_llm_api_key or settings.groq_api_key
+    if not api_key:
         return None
 
     prompt = (
@@ -777,51 +926,30 @@ def _llm_compose_email_fields(
         "- Keep the recipient email exactly as requested.\n"
         "- Ignore non-email tasks such as calendar actions.\n"
         "- Subject should be concise and professional.\n"
-        "- Body should be clear, complete, and user-ready.\n"
+        "- Body should be clear, complete, and ready to send.\n"
+        "- Convert indirect instructions like 'tell him'/'let her know' into final recipient-facing wording.\n"
         "- Do not include markdown.\n"
     )
-    payload = {
-        "model": settings.router_llm_model,
-        "temperature": 0.2,
-        "max_tokens": 240,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"User request:\n{user_text}\n\n"
-                    f"Fallback recipient: {fallback_to}\n"
-                    f"Fallback subject: {fallback_subject}\n"
-                    f"Fallback body: {fallback_body}\n"
-                ),
-            },
-        ],
-    }
-    body = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.groq_api_key}",
-        },
-        method="POST",
+    response = call_json_chat_completion(
+        provider=settings.planner_llm_provider,
+        model=settings.planner_llm_model,
+        api_key=api_key,
+        timeout_seconds=max(4, settings.router_llm_timeout_seconds),
+        api_base_url=settings.planner_llm_api_base_url,
+        system_prompt=prompt,
+        user_prompt=(
+            f"User request:\n{user_text}\n\n"
+            f"Fallback recipient: {fallback_to}\n"
+            f"Fallback subject: {fallback_subject}\n"
+            f"Fallback body: {fallback_body}\n"
+        ),
+        max_tokens=280,
+        temperature=0.2,
     )
-    try:
-        with urlrequest.urlopen(req, timeout=max(4, settings.router_llm_timeout_seconds)) as res:
-            response_payload = json.loads(res.read().decode("utf-8"))
-    except Exception:
+    if response.error is not None or not response.data:
         return None
 
-    content = (
-        response_payload.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
-    parsed = _extract_json_object(content)
-    if not isinstance(parsed, dict):
-        return None
+    parsed = response.data
     to_addr = _normalize_extracted_field(str(parsed.get("to") or fallback_to), max_len=320).lower()
     subject = _normalize_extracted_field(str(parsed.get("subject") or fallback_subject), max_len=300)
     email_body = _normalize_extracted_field(str(parsed.get("body") or fallback_body), max_len=5000)
@@ -836,69 +964,94 @@ def _llm_compose_email_fields(
     return to_addr, subject, email_body
 
 
-def _compose_email_fields_fallback(
-    user_text: str,
-    fallback_subject: str,
-    fallback_body: str,
-) -> tuple[str, str]:
-    cleaned_user_text = _normalize_quote_chars(user_text or "")
-    subject = _normalize_extracted_field(
-        _trim_non_email_followup_fragments(fallback_subject),
-        max_len=300,
-    )
-    body_intent = _normalize_extracted_field(
-        _trim_non_email_followup_fragments(fallback_body),
-        max_len=5000,
-    )
+def _normalize_composed_email_body(value: str) -> str:
+    candidate = _rewrite_instructional_email_body(value or "")
+    if not candidate:
+        return ""
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    if candidate.lower().startswith("that "):
+        candidate = candidate[5:].strip()
+    return candidate
 
-    body_intent = re.sub(
-        r"(?:\.\.\.|…|\bthen\b|\band then\b|\band\b)\s*$",
+
+def _looks_like_low_quality_composed_body(value: str) -> bool:
+    lowered = (value or "").strip().lower()
+    if not lowered:
+        return True
+    if lowered.startswith("that "):
+        return True
+    if "let him know" in lowered or "tell him" in lowered:
+        return True
+    if "you, cortex" in lowered or "you are cortex" in lowered:
+        return True
+    if len(lowered.split()) < 4:
+        return True
+    return False
+
+
+def _normalize_subject_for_send(subject: str, body: str) -> str:
+    cleaned = _normalize_extracted_field(subject, max_len=300)
+    lowered = cleaned.lower()
+    if lowered.startswith(("that ", "i will ", "let him ", "tell him ", "you, cortex")):
+        cleaned = ""
+    if not cleaned:
+        cleaned = _infer_subject_from_body(body)
+    cleaned = _normalize_extracted_field(cleaned, max_len=300)
+    return cleaned or "Quick note"
+
+
+def _rewrite_instructional_email_body(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    candidate = re.sub(
+        r"\b(?:please\s+)?(?:let|tell)\s+(?:him|her|them)\s+know(?:\s+that)?\s+",
         "",
-        body_intent,
+        candidate,
         flags=re.IGNORECASE,
-    ).strip(" .")
-    if not body_intent:
-        body_intent = "reaching out with a quick update"
-
-    lowered_request = cleaned_user_text.lower()
-    lowered_intent = body_intent.lower()
-
-    if not subject:
-        if re.search(r"\b(gratitude|grateful|appreciate|appreciation|thank)\b", lowered_request):
-            subject = "Thank You for the Opportunity"
-        else:
-            subject = _infer_subject_from_body(body_intent) or "Quick note"
-    subject = _normalize_extracted_field(subject, max_len=300) or "Quick note"
-    mention_gratitude = bool(
-        re.search(r"\b(gratitude|grateful|appreciate|appreciation|thank)\b", lowered_request)
-        or re.search(r"\b(gratitude|grateful|appreciate|appreciation|thank)\b", lowered_intent)
     )
-    normalized_intent = re.sub(r"\bexcepted\b", "accepted", body_intent, flags=re.IGNORECASE).strip()
-    if lowered_intent.startswith("expressing my gratitude"):
-        normalized_intent = (
-            "I wanted to express my gratitude for the opportunity "
-            "and share how excited I am to move forward."
-        )
-
-    if normalized_intent and normalized_intent[-1] not in ".!?":
-        normalized_intent = f"{normalized_intent}."
-    if normalized_intent:
-        normalized_intent = normalized_intent[0].upper() + normalized_intent[1:]
-
-    gratitude_sentence = (
-        "Thank you again for the opportunity."
-        if mention_gratitude
-        else "Please let me know if you would like to discuss details or next steps."
+    candidate = re.sub(
+        r"\b(?:please\s+)?tell\s+(?:him|her|them)\s+that\s+",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
     )
-
-    composed = (
-        "Hi,\n\n"
-        f"{normalized_intent}\n\n"
-        f"{gratitude_sentence}\n\n"
-        "Best,\n"
-        "Patrick"
+    candidate = re.sub(
+        r"\b(?:also|and)\s+let\s+(?:him|her|them)\s+know(?:\s+that)?\s+",
+        "Also, ",
+        candidate,
+        flags=re.IGNORECASE,
     )
-    return subject, composed
+    candidate = re.sub(r"\bhep\b", "help", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\bim\b", "I am", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\bi['’]m\b", "I am", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(
+        r"\b(?:you,\s*)?cortex(?:\s*\(my\s+agent\))?\s+can\s+handle\b",
+        "my assistant Cortex can handle",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"\byou are cortex\b",
+        "this message is being sent by my assistant Cortex",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"\byou can handle\b",
+        "it can handle",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"\bmy agent sent this message\b",
+        "this message was sent by my assistant",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r"^\s*that\s+", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .")
+    return candidate
 
 
 def _extract_json_object(content: str) -> dict[str, object] | None:
@@ -1114,6 +1267,18 @@ def _infer_subject_from_body(body: str) -> str:
     cleaned = _normalize_extracted_field(body, max_len=300)
     if not cleaned:
         return ""
+    lowered = cleaned.lower()
+    if "video shoot" in lowered:
+        time_match = re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", lowered)
+        if time_match:
+            return f"Video shoot at {time_match.group(0).upper()}"
+        return "Video shoot update"
+    cleaned = re.sub(
+        r"^(?:that\s+)?i\s+(?:will|am|wanted\s+to)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip(" -:;,.")
     words = cleaned.split()
     if not words:
         return ""

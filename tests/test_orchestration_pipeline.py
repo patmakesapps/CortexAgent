@@ -7,6 +7,7 @@ from unittest.mock import patch
 from cortexagent.services.connected_accounts_repo import ConnectedAccount, ResolvedProviderToken
 from cortexagent.services.google_oauth import GoogleTokenExchange
 from cortexagent.services.orchestrator import AgentOrchestrator
+from cortexagent.services.planner import PlannerDecision, PlannerStep
 from cortexagent.tools.base import Tool, ToolContext, ToolResult, ToolResultItem
 from cortexagent.tools.registry import ToolRegistry
 
@@ -136,7 +137,7 @@ class _FakeSensitiveGmailTool(Tool):
                         url="https://mail.google.com/mail/u/0/#drafts?compose=r-123",
                         snippet=(
                             "I am ready to send this draft:\n"
-                            "- To: purpleparkstudios@gmail.com\n"
+                            "- To: recipient@example.com\n"
                             "- Subject: Quick note\n"
                             "- Body: I will be able to do the video for $4,000 on April 2nd at 6pm.\n"
                             "Reply with 'confirm' to send, or 'cancel' to stop."
@@ -218,7 +219,7 @@ class _FakePendingThenConfirmGmailTool(Tool):
                     ToolResultItem(
                         title="[Sent] Draft r-123",
                         url="https://mail.google.com/mail/u/0/#inbox/thread-1",
-                        snippet="Message id: msg-1 | To: purpleparkstudios@gmail.com",
+                        snippet="Message id: msg-1 | To: recipient@example.com",
                     )
                 ],
             )
@@ -231,7 +232,7 @@ class _FakePendingThenConfirmGmailTool(Tool):
                     url="https://mail.google.com/mail/u/0/#drafts?compose=r-123",
                     snippet=(
                         "I am ready to send this draft:\n"
-                        "- To: purpleparkstudios@gmail.com\n"
+                        "- To: recipient@example.com\n"
                         "- Subject: Meeting agenda\n"
                         "- Body: I am available to film the video for $4,000.\n"
                         "Reply with 'confirm' to send, or 'cancel' to stop."
@@ -495,7 +496,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
                 thread_id="thread-3",
                 text=(
                     "add my meeting with james from Purple Park Studios to calendar set it for 2pm on Friday "
-                    "then email purpleparkstudios@gmail.com confirming the meeting"
+                    "then email recipient@example.com confirming the meeting"
                 ),
                 short_term_limit=30,
                 authorization="Bearer token",
@@ -512,7 +513,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
         self.assertEqual(steps[0].get("action"), "google_calendar")
         self.assertEqual(steps[1].get("action"), "google_gmail")
         self.assertEqual(len(gmail_tool.queries), 1)
-        self.assertIn("send an email to purpleparkstudios@gmail.com", gmail_tool.queries[0].lower())
+        self.assertIn("send an email to recipient@example.com", gmail_tool.queries[0].lower())
         self.assertIn("confirming our meeting", gmail_tool.queries[0].lower())
 
     def test_orchestrator_preserves_sensitive_write_intents_and_marks_action_required(self):
@@ -556,7 +557,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
             result = orchestrator.handle_chat(
                 thread_id="thread-sensitive",
                 text=(
-                    "i need you to email purpleparkstudios@gmail.com and tell them "
+                    "i need you to email recipient@example.com and tell them "
                     "I will be able to do the video for $4,000 on April 2nd at 6pm. "
                     "please add it to my calendar as well"
                 ),
@@ -622,7 +623,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
             first = orchestrator.handle_chat(
                 thread_id="thread-confirm-both",
                 text=(
-                    "send an email to purpleparkstudios@gmail.com and in the email make the subject "
+                    "send an email to recipient@example.com and in the email make the subject "
                     "\"Meeting agenda\" then compose the body stating i am available to film the video "
                     "for $4,000. Then add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia"
                 ),
@@ -640,6 +641,476 @@ class OrchestrationPipelineTests(unittest.TestCase):
         self.assertIn("Completed: 2", second.response)
         self.assertTrue(any(query.lower().startswith("confirm send draft") for query in gmail_tool.queries))
         self.assertTrue(any(query.lower().startswith("confirm:") for query in calendar_tool.queries))
+
+    def test_noisy_confirm_executes_both_pending_actions(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        gmail_tool = _FakePendingThenConfirmGmailTool()
+        calendar_tool = _FakePendingThenConfirmCalendarTool()
+        registry = ToolRegistry()
+        registry.register(gmail_tool)
+        registry.register(calendar_tool)
+        ltm_client = _FakeLtmClient(events=[])
+        orchestrator = AgentOrchestrator(
+            ltm_client=ltm_client,  # type: ignore[arg-type]
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-noisy-confirm",
+                text=(
+                    "send an email to recipient@example.com and in the email make the subject "
+                    "\"Meeting agenda\" then compose the body stating i am available to film the video "
+                    "for $4,000. Then add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia"
+                ),
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-noisy-confirm",
+                text="yehhhh",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Action required: 2", first.response)
+        self.assertIn("Completed: 2", second.response)
+        self.assertTrue(any(query.lower().startswith("confirm send draft") for query in gmail_tool.queries))
+        self.assertTrue(any(query.lower().startswith("confirm:") for query in calendar_tool.queries))
+
+    def test_noisy_cancel_cancels_both_pending_actions(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        gmail_tool = _FakePendingThenConfirmGmailTool()
+        calendar_tool = _FakePendingThenConfirmCalendarTool()
+        registry = ToolRegistry()
+        registry.register(gmail_tool)
+        registry.register(calendar_tool)
+        ltm_client = _FakeLtmClient(events=[])
+        orchestrator = AgentOrchestrator(
+            ltm_client=ltm_client,  # type: ignore[arg-type]
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-noisy-cancel",
+                text=(
+                    "send an email to recipient@example.com and in the email make the subject "
+                    "\"Meeting agenda\" then compose the body stating i am available to film the video "
+                    "for $4,000. Then add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia"
+                ),
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-noisy-cancel",
+                text="nahhh",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Action required: 2", first.response)
+        self.assertIn("canceled both pending requests", second.response.lower())
+        self.assertFalse(any(query.lower().startswith("confirm send draft") for query in gmail_tool.queries))
+        self.assertFalse(any(query.lower().startswith("confirm:") for query in calendar_tool.queries))
+
+    def test_ambiguous_calendar_reply_does_not_auto_confirm(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        calendar_tool = _FakePendingThenConfirmCalendarTool()
+        registry = ToolRegistry()
+        registry.register(calendar_tool)
+        ltm_client = _FakeLtmClient(events=[])
+        orchestrator = AgentOrchestrator(
+            ltm_client=ltm_client,  # type: ignore[arg-type]
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ):
+            first = orchestrator.handle_chat(
+                thread_id="thread-ambiguous",
+                text="add to my calendar Meeting with Rob on March 2nd at 1pm in Philadelphia",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+            second = orchestrator.handle_chat(
+                thread_id="thread-ambiguous",
+                text="i guess maybe",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertIn("Should I add this to Google Calendar?", first.response)
+        self.assertIn("still pending", second.response.lower())
+        self.assertEqual(len(calendar_tool.queries), 1)
+
+    def test_orchestration_persists_planner_metadata(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        gmail_tool = _FakeGoogleGmailTool()
+        drive_tool = _FakeGoogleDriveTool()
+        registry = ToolRegistry()
+        registry.register(gmail_tool)
+        registry.register(drive_tool)
+        ltm_client = _FakeLtmClient(events=[])
+        orchestrator = AgentOrchestrator(
+            ltm_client=ltm_client,  # type: ignore[arg-type]
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        planner_decision = PlannerDecision(
+            steps=[
+                PlannerStep(
+                    step_id="step_1",
+                    action="google_gmail",
+                    query="check my inbox",
+                    expected_outcome="gmail_read",
+                    requires_confirmation=False,
+                    depends_on=[],
+                ),
+                PlannerStep(
+                    step_id="step_2",
+                    action="google_drive",
+                    query="find relevant files in drive",
+                    expected_outcome="drive_search",
+                    requires_confirmation=False,
+                    depends_on=["step_1"],
+                ),
+            ],
+            metadata={
+                "planner_used": True,
+                "planner_attempted": True,
+                "planner_source": "llm",
+                "planner_provider": "groq",
+                "planner_model": "llama-3.1-8b-instant",
+                "planner_confidence": 0.91,
+                "planner_reason": "test_plan",
+                "validation_result": "valid",
+                "fallback_reason": None,
+            },
+        )
+
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ), patch(
+            "cortexagent.services.orchestrator.build_orchestration_plan",
+            return_value=planner_decision,
+        ):
+            result = orchestrator.handle_chat(
+                thread_id="thread-planner-meta",
+                text="check inbox then find files",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertEqual(result.decision.action, "orchestration")
+        assistant_events = [event for event in ltm_client.events if event["actor"] == "assistant"]
+        self.assertTrue(assistant_events)
+        pipeline_meta = assistant_events[-1]["meta"]["tool_pipeline"]
+        self.assertIn("planner", pipeline_meta)
+        planner_meta = pipeline_meta["planner"]
+        self.assertTrue(bool(planner_meta.get("planner_used")))
+        self.assertEqual(planner_meta.get("validation_result"), "valid")
+
+    def test_planner_failure_falls_back_to_route_classifier(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        gmail_tool = _FakeGoogleGmailTool()
+        registry = ToolRegistry()
+        registry.register(gmail_tool)
+        ltm_client = _FakeLtmClient(events=[])
+        orchestrator = AgentOrchestrator(
+            ltm_client=ltm_client,  # type: ignore[arg-type]
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        planner_failure = PlannerDecision(
+            steps=[],
+            metadata={
+                "planner_used": False,
+                "planner_attempted": True,
+                "planner_source": "fallback",
+                "planner_provider": "groq",
+                "planner_model": "llama-3.1-8b-instant",
+                "planner_confidence": 0.0,
+                "planner_reason": "llm_request_failed",
+                "validation_result": "timeout",
+                "fallback_reason": "timeout",
+            },
+        )
+
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ), patch(
+            "cortexagent.services.orchestrator.build_orchestration_plan",
+            return_value=planner_failure,
+        ):
+            result = orchestrator.handle_chat(
+                thread_id="thread-router-fallback",
+                text="check my inbox",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertEqual(result.decision.action, "google_gmail")
+        self.assertEqual(len(gmail_tool.queries), 1)
+
+    def test_llm_only_tool_intent_falls_back_to_gmail_hint_route(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        gmail_tool = _FakeGoogleGmailTool()
+        registry = ToolRegistry()
+        registry.register(gmail_tool)
+        ltm_client = _FakeLtmClient(events=[])
+        orchestrator = AgentOrchestrator(
+            ltm_client=ltm_client,  # type: ignore[arg-type]
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        planner_failure = PlannerDecision(
+            steps=[],
+            metadata={
+                "planner_used": False,
+                "planner_attempted": True,
+                "planner_source": "fallback",
+                "planner_provider": "groq",
+                "planner_model": "llama-3.1-8b-instant",
+                "planner_confidence": 0.0,
+                "planner_reason": "llm_request_failed",
+                "validation_result": "timeout",
+                "fallback_reason": "timeout",
+            },
+        )
+
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ), patch(
+            "cortexagent.services.orchestrator.settings.agent_decision_mode",
+            "llm_only",
+        ), patch(
+            "cortexagent.services.orchestrator.settings.agent_tools_enabled",
+            True,
+        ), patch(
+            "cortexagent.services.orchestrator.settings.web_search_enabled",
+            True,
+        ), patch(
+            "cortexagent.services.orchestrator.build_orchestration_plan",
+            side_effect=[planner_failure, planner_failure],
+        ):
+            result = orchestrator.handle_chat(
+                thread_id="thread-llm-only-gmail-hint",
+                text="check my gmail",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertEqual(result.decision.action, "google_gmail")
+        self.assertEqual(result.decision.reason, "llm_only_tool_intent_hint_fallback")
+        self.assertEqual(len(gmail_tool.queries), 1)
+
+    def test_llm_only_tool_intent_falls_back_to_calendar_hint_route(self):
+        account = _active_account()
+        resolved = ResolvedProviderToken(
+            access_token=account.access_token,
+            refresh_token=account.refresh_token,
+            expires_at=account.expires_at,
+            scope=account.scope,
+            token_type=account.token_type,
+            is_access_token_expired=False,
+            account=account,
+        )
+        repo = _FakeRepo(resolved=resolved)
+        oauth = _FakeGoogleOAuth(
+            GoogleTokenExchange(
+                access_token="access-1",
+                refresh_token="refresh-1",
+                token_type="Bearer",
+                scope=account.scope,
+                expires_in=3600,
+            )
+        )
+        calendar_tool = _FakeGoogleCalendarTool()
+        registry = ToolRegistry()
+        registry.register(calendar_tool)
+        ltm_client = _FakeLtmClient(events=[])
+        orchestrator = AgentOrchestrator(
+            ltm_client=ltm_client,  # type: ignore[arg-type]
+            tool_registry=registry,
+            connected_accounts_repo=repo,  # type: ignore[arg-type]
+            google_oauth=oauth,  # type: ignore[arg-type]
+        )
+        planner_failure = PlannerDecision(
+            steps=[],
+            metadata={
+                "planner_used": False,
+                "planner_attempted": True,
+                "planner_source": "fallback",
+                "planner_provider": "groq",
+                "planner_model": "llama-3.1-8b-instant",
+                "planner_confidence": 0.0,
+                "planner_reason": "llm_request_failed",
+                "validation_result": "timeout",
+                "fallback_reason": "timeout",
+            },
+        )
+
+        with patch(
+            "cortexagent.services.orchestrator.resolve_user_id_from_authorization",
+            return_value="user-1",
+        ), patch(
+            "cortexagent.services.orchestrator.settings.agent_decision_mode",
+            "llm_only",
+        ), patch(
+            "cortexagent.services.orchestrator.settings.agent_tools_enabled",
+            True,
+        ), patch(
+            "cortexagent.services.orchestrator.settings.web_search_enabled",
+            True,
+        ), patch(
+            "cortexagent.services.orchestrator.build_orchestration_plan",
+            side_effect=[planner_failure, planner_failure],
+        ):
+            result = orchestrator.handle_chat(
+                thread_id="thread-llm-only-calendar-hint",
+                text="check my calendar",
+                short_term_limit=30,
+                authorization="Bearer token",
+            )
+
+        self.assertEqual(result.decision.action, "google_calendar")
+        self.assertEqual(result.decision.reason, "llm_only_tool_intent_hint_fallback")
+        self.assertEqual(len(calendar_tool.queries), 1)
 
 
 if __name__ == "__main__":

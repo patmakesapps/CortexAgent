@@ -103,6 +103,71 @@ class GoogleGmailToolTests(unittest.TestCase):
         self.assertEqual(result.items[0].title, "[Drafted] New email")
         draft_mock.assert_called_once()
 
+    def test_reply_to_phrase_routes_to_draft_reply(self):
+        tool = GoogleGmailTool()
+        with patch.object(
+            tool,
+            "_draft_reply",
+            return_value=ToolResultItem(
+                title="[Drafted] Thread bbbbbb2",
+                url="https://mail.google.com/",
+                snippet="To: sender@example.com | Subject: Re: Personal Update",
+            ),
+        ) as reply_mock:
+            result = tool.run(
+                ToolContext(
+                    thread_id="thread-1",
+                    user_text=(
+                        "can you reply to the sender from example corp and let them know "
+                        "I appreciate his help but I will pass for now"
+                    ),
+                    tool_meta={"access_token": "token-1"},
+                )
+            )
+        self.assertEqual(result.items[0].title, "[Drafted] Thread bbbbbb2")
+        reply_mock.assert_called_once()
+
+    def test_draft_reply_selects_sender_hint_from_recent_threads(self):
+        tool = GoogleGmailTool()
+        with patch.object(
+            tool,
+            "_list_recent_threads",
+            return_value=[
+                ToolResultItem(
+                    title="Thread aaaaaa1 | Team update",
+                    url="https://mail.google.com/mail/u/0/#inbox/aaaaaa1",
+                    snippet="From: Team Inbox <team@example.com>",
+                ),
+                ToolResultItem(
+                    title="Thread bbbbbb2 | Personal Update | Example Training",
+                    url="https://mail.google.com/mail/u/0/#inbox/bbbbbb2",
+                    snippet="From: Jordan from Example <jordan@example.com>",
+                ),
+            ],
+        ), patch.object(
+            tool,
+            "_get_thread_metadata",
+            return_value={
+                "reply_to": "",
+                "from_email": "jordan@example.com",
+                "subject": "Personal Update | Example Training",
+                "message_id": "<mid-1>",
+            },
+        ), patch(
+            "cortexagent.tools.google_gmail._api_request_json",
+            return_value={"id": "r-9"},
+        ):
+            drafted = tool._draft_reply(
+                access_token="token-1",
+                user_text=(
+                    "reply to the sender from example corp and let them know "
+                    "I appreciate his help but I will pass for now"
+                ),
+            )
+
+        self.assertIn("[Drafted] Thread bbbbbb2", drafted.title)
+        self.assertIn("I appreciate his help", drafted.snippet)
+
     def test_read_message_intent(self):
         tool = GoogleGmailTool()
         with patch.object(
@@ -212,49 +277,49 @@ class GoogleGmailToolTests(unittest.TestCase):
 
     def test_extract_new_email_fields_accepts_say_before_subject(self):
         to_addr, subject, body = _extract_new_email_fields(
-            'send an email to purpleparkstudios@gmail.com and say "hey test" subject "yo"'
+            'send an email to recipient@example.com and say "hey test" subject "yo"'
         )
-        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertEqual(to_addr, "recipient@example.com")
         self.assertEqual(subject, "yo")
         self.assertEqual(body, "hey test")
 
     def test_extract_new_email_fields_accepts_say_after_subject(self):
         to_addr, subject, body = _extract_new_email_fields(
-            'send an email to purpleparkstudios@gmail.com subject "yo" say "hey test"'
+            'send an email to recipient@example.com subject "yo" say "hey test"'
         )
-        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertEqual(to_addr, "recipient@example.com")
         self.assertEqual(subject, "yo")
         self.assertEqual(body, "hey test")
 
     def test_extract_new_email_fields_inferrs_subject_from_body(self):
         to_addr, subject, body = _extract_new_email_fields(
-            'send an email to purpleparkstudios@gmail.com say "hey test from cortex"'
+            'send an email to recipient@example.com say "hey test from cortex"'
         )
-        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertEqual(to_addr, "recipient@example.com")
         self.assertEqual(subject, "hey test from cortex")
         self.assertEqual(body, "hey test from cortex")
 
     def test_extract_new_email_fields_inferrs_body_from_freeform_text(self):
         to_addr, subject, body = _extract_new_email_fields(
-            "send an email to purpleparkstudios@gmail.com hello this is a test note"
+            "send an email to recipient@example.com hello this is a test note"
         )
-        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertEqual(to_addr, "recipient@example.com")
         self.assertEqual(subject, "hello this is a test note")
         self.assertEqual(body, "hello this is a test note")
 
     def test_extract_new_email_fields_rejects_ambiguous_short_body(self):
         with self.assertRaises(RuntimeError):
-            _extract_new_email_fields("send an email to purpleparkstudios@gmail.com say s")
+            _extract_new_email_fields("send an email to recipient@example.com say s")
 
     def test_send_intent_accepts_sned_typo(self):
         self.assertTrue(
-            _is_send_new_email_intent("sned an email to purpleparkstudios@gmail.com hey")
+            _is_send_new_email_intent("sned an email to recipient@example.com hey")
         )
 
     def test_send_intent_accepts_email_as_verb(self):
         self.assertTrue(
             _is_send_new_email_intent(
-                'email purpleparkstudios@gmail.com and say "what up test butt"'
+                'email recipient@example.com and say "what up test butt"'
             )
         )
 
@@ -272,7 +337,7 @@ class GoogleGmailToolTests(unittest.TestCase):
             result = tool.run(
                 ToolContext(
                     thread_id="thread-1",
-                    user_text='email purpleparkstudios@gmail.com and say "what up test butt"',
+                    user_text='email recipient@example.com and say "what up test butt"',
                     tool_meta={"access_token": "token-1"},
                 )
             )
@@ -281,10 +346,10 @@ class GoogleGmailToolTests(unittest.TestCase):
 
     def test_extract_new_email_fields_handles_tell_them_and_trims_calendar_followup(self):
         to_addr, subject, body = _extract_new_email_fields(
-            "email purpleparkstudios@gmail.com and tell them I will be able to do the video "
+            "email recipient@example.com and tell them I will be able to do the video "
             "for $4,000 on April 2nd at 6pm please add it to my calendar as well"
         )
-        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertEqual(to_addr, "recipient@example.com")
         self.assertTrue(subject)
         self.assertIn("I will be able to do the video for $4,000 on April 2nd at 6pm", body)
         self.assertNotIn("add it to my calendar", body.lower())
@@ -293,22 +358,60 @@ class GoogleGmailToolTests(unittest.TestCase):
         with patch(
             "cortexagent.tools.google_gmail._llm_compose_email_fields",
             return_value=(
-                "purpleparkstudios@gmail.com",
+                "recipient@example.com",
                 "Meeting agenda",
                 "Hi Rob, I am available to film the video for $4,000. Thanks.",
             ),
         ) as llm_mock:
             to_addr, subject, body = _extract_new_email_fields(
-                "send an email to purpleparkstudios@gmail.com and in the email make the subject "
+                "send an email to recipient@example.com and in the email make the subject "
                 "\"Meeting agenda\" then compose the body stating i am available to film the video "
                 "for $4,000. Then add to my calendar meeting with Rob."
             )
 
-        self.assertEqual(to_addr, "purpleparkstudios@gmail.com")
+        self.assertEqual(to_addr, "recipient@example.com")
         self.assertEqual(subject, "Meeting agenda")
         self.assertEqual(
             body, "Hi Rob, I am available to film the video for $4,000. Thanks"
         )
+        llm_mock.assert_called_once()
+
+    def test_extract_new_email_fields_prefers_llm_composer_for_plain_send_intent(self):
+        with patch(
+            "cortexagent.tools.google_gmail._llm_compose_email_fields",
+            return_value=(
+                "recipient@example.com",
+                "Video shoot update",
+                (
+                    "Hi Anthony,\n\n"
+                    "I will be at the video shoot at 9am. "
+                    "My assistant Cortex can handle getting the address and any other details.\n\n"
+                    "Best,\nPatrick"
+                ),
+            ),
+        ) as llm_mock:
+            to_addr, subject, body = _extract_new_email_fields(
+                "send an email to recipient@example.com and let him know that I will be at "
+                "the video shoot at 9am. Let him know you, Cortex (my agent) can handle getting "
+                "the address and any other info to Pat"
+            )
+
+        self.assertEqual(to_addr, "recipient@example.com")
+        self.assertEqual(subject, "Video shoot update")
+        self.assertIn("I will be at the video shoot at 9am", body)
+        self.assertIn("My assistant Cortex can handle", body)
+        llm_mock.assert_called_once()
+
+    def test_extract_new_email_fields_requires_llm_composer_for_intent_drafting(self):
+        with patch(
+            "cortexagent.tools.google_gmail._llm_compose_email_fields",
+            return_value=None,
+        ) as llm_mock:
+            with self.assertRaises(RuntimeError):
+                _extract_new_email_fields(
+                    "send an email to sender@example.com and tell him i appreciate his hep but at this "
+                    "time im going to pass on the offer...also...let him know my agent sent this message"
+                )
         llm_mock.assert_called_once()
 
     def test_send_message_uses_gmail_drafts_send_endpoint(self):

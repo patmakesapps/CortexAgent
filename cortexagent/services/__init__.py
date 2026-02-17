@@ -6,7 +6,6 @@ from .connected_accounts_repo import (
     ResolvedProviderToken,
 )
 from .google_oauth import GoogleOAuthService
-from .orchestrator import AgentOrchestrator, OrchestratorResult
 from .supabase_auth import resolve_user_id_from_authorization
 
 __all__ = [
@@ -20,3 +19,14 @@ __all__ = [
     "AgentOrchestrator",
     "OrchestratorResult",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"AgentOrchestrator", "OrchestratorResult"}:
+        from .orchestrator import AgentOrchestrator, OrchestratorResult
+
+        return {
+            "AgentOrchestrator": AgentOrchestrator,
+            "OrchestratorResult": OrchestratorResult,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

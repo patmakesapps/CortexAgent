@@ -44,11 +44,26 @@ v1 goal:
   - detects multi-intent requests spanning Gmail + Drive + Calendar (+ optional web)
   - executes ordered tool steps in a single turn
   - stores structured per-step pipeline metadata in thread events
+- Added LLM-first planner for multi-step orchestration:
+  - strict JSON plan output with schema validation and bounded tool allowlist
+  - dynamic step composition across Gmail/Calendar/Drive/Web Search
+  - deterministic fallback to legacy regex planner + single-route classifier
+  - planner diagnostics persisted in orchestration metadata (`planner_used`, confidence, validation, fallback reason)
+- Improved pending confirmation intent handling:
+  - LLM-assisted + deterministic confirmation classifier for noisy replies
+  - recognizes sloppy confirms/cancels (for example: `yehhhh`, `yuppp`, `nahhh`, `nopeee`)
+  - avoids auto-confirm on ambiguous replies and keeps explicit write confirmations for Gmail/Calendar
 
 ## Architecture
 
 - `cortexagent/router/intent_router.py`
   - Heuristic/model intent gating (`chat` vs `web_search` vs `google_calendar` vs `google_drive` vs `google_gmail`)
+- `cortexagent/services/planner.py`
+  - LLM-first orchestration planner with strict JSON schema + fallback diagnostics
+- `cortexagent/services/confirmation_intent.py`
+  - Pending-confirmation intent classifier (deterministic + optional LLM assist)
+- `cortexagent/services/llm_json_client.py`
+  - Shared OpenAI-compatible JSON completion caller (Groq and openai/openai_compatible providers)
 - `cortexagent/tools/base.py`
   - Generic tool interfaces
 - `cortexagent/tools/registry.py`
@@ -122,6 +137,18 @@ Optional:
 - `AGENT_ROUTER_LLM_MODEL` (default: `AGENT_ROUTER_LLM_MODEL` -> `GROQ_ROUTER_MODEL` -> `GROQ_CHAT_MODEL` -> `llama-3.1-8b-instant`)
 - `AGENT_ROUTER_LLM_TIMEOUT_SECONDS` (default `6`)
 - `GROQ_API_KEY` (enables model-based route decisions; without it router falls back to heuristics)
+- `AGENT_PLANNER_LLM_ENABLED` (`true`/`false`, default `true`)
+- `AGENT_PLANNER_LLM_PROVIDER` (`groq` or `openai`/`openai_compatible`, default `groq`)
+- `AGENT_PLANNER_LLM_MODEL` (planner model id; defaults to router model chain, e.g. `llama-3.1-8b-instant`)
+- `AGENT_PLANNER_LLM_TIMEOUT_SECONDS` (default `8`)
+- `AGENT_PLANNER_MAX_STEPS` (max validated planner steps, default `4`)
+- `AGENT_PLANNER_MIN_CONFIDENCE` (minimum accepted planner confidence in `[0,1]`, default `0.55`)
+- `AGENT_DECISION_MODE` (`hybrid`, `llm_first`, or `llm_only`; default `llm_only`)
+- `AGENT_PLANNER_LLM_API_BASE_URL` (required for `openai`/`openai_compatible`; defaults to `https://api.openai.com/v1`)
+- `AGENT_PLANNER_LLM_API_KEY` (planner provider API key; defaults to `GROQ_API_KEY` for Groq compatibility)
+- `AGENT_CONFIRMATION_LLM_ENABLED` (`true`/`false`, default `true`)
+- `AGENT_CONFIRMATION_LLM_TIMEOUT_SECONDS` (default `4`)
+- `AGENT_CONFIRMATION_LLM_MIN_CONFIDENCE` (minimum accepted confirmation-classifier confidence, default `0.72`)
 - `SUPABASE_URL` (required for integration connect routes that validate bearer auth)
 - `SUPABASE_ANON_KEY` (required for integration connect routes that validate bearer auth)
 - `SUPABASE_SERVICE_ROLE_KEY` (required for connected-account writes via Supabase PostgREST)
@@ -145,4 +172,6 @@ Optional:
 
 - The tool system is intentionally modular for future connectors (Notion, Slack, Calendar, etc.).
 - Routing is model-first (system-prompt classifier) with heuristic fallback.
+- Multi-step orchestration is planner-first with strict validation and deterministic fallback.
 - Calendar write confirmations are intentionally explicit to avoid accidental writes.
+- GPT-OSS migration path: keep `AGENT_PLANNER_LLM_PROVIDER=groq` for current Llama flow, or switch planner to `openai`/`openai_compatible` with `AGENT_PLANNER_LLM_MODEL=<gpt-oss-model>` and provider base URL/API key.

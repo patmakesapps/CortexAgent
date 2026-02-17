@@ -27,6 +27,15 @@ def _as_int(raw: str | None, default: int) -> int:
         return default
 
 
+def _as_float(raw: str | None, default: float) -> float:
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     cortexltm_api_base_url: str
@@ -42,6 +51,18 @@ class Settings:
     router_llm_enabled: bool
     router_llm_model: str
     router_llm_timeout_seconds: int
+    planner_llm_enabled: bool
+    planner_llm_provider: str
+    planner_llm_model: str
+    planner_llm_api_base_url: str | None
+    planner_llm_api_key: str | None
+    planner_llm_timeout_seconds: int
+    planner_llm_max_steps: int
+    planner_llm_min_confidence: float
+    agent_decision_mode: str
+    confirmation_intent_llm_enabled: bool
+    confirmation_intent_llm_timeout_seconds: int
+    confirmation_intent_llm_min_confidence: float
     supabase_url: str | None
     supabase_anon_key: str | None
     supabase_service_role_key: str | None
@@ -61,6 +82,10 @@ def load_settings() -> Settings:
         or os.getenv("GROQ_CHAT_MODEL")
         or "llama-3.1-8b-instant"
     )
+    planner_model = (
+        os.getenv("AGENT_PLANNER_LLM_MODEL")
+        or router_model
+    )
     return Settings(
         cortexltm_api_base_url=os.getenv(
             "CORTEXLTM_API_BASE_URL", "http://127.0.0.1:8000"
@@ -78,6 +103,46 @@ def load_settings() -> Settings:
         router_llm_model=router_model,
         router_llm_timeout_seconds=_as_int(
             os.getenv("AGENT_ROUTER_LLM_TIMEOUT_SECONDS"), 6
+        ),
+        planner_llm_enabled=_as_bool(os.getenv("AGENT_PLANNER_LLM_ENABLED"), True),
+        planner_llm_provider=os.getenv("AGENT_PLANNER_LLM_PROVIDER", "groq").strip().lower(),
+        planner_llm_model=planner_model,
+        planner_llm_api_base_url=(os.getenv("AGENT_PLANNER_LLM_API_BASE_URL") or None),
+        planner_llm_api_key=(
+            os.getenv("AGENT_PLANNER_LLM_API_KEY")
+            or os.getenv("GROQ_API_KEY")
+            or None
+        ),
+        planner_llm_timeout_seconds=_as_int(
+            os.getenv("AGENT_PLANNER_LLM_TIMEOUT_SECONDS"), 8
+        ),
+        planner_llm_max_steps=max(
+            2,
+            _as_int(os.getenv("AGENT_PLANNER_MAX_STEPS"), 4),
+        ),
+        planner_llm_min_confidence=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("AGENT_PLANNER_MIN_CONFIDENCE"), 0.55),
+            ),
+        ),
+        agent_decision_mode=(
+            os.getenv("AGENT_DECISION_MODE", "llm_only").strip().lower()
+            or "llm_only"
+        ),
+        confirmation_intent_llm_enabled=_as_bool(
+            os.getenv("AGENT_CONFIRMATION_LLM_ENABLED"), True
+        ),
+        confirmation_intent_llm_timeout_seconds=_as_int(
+            os.getenv("AGENT_CONFIRMATION_LLM_TIMEOUT_SECONDS"), 4
+        ),
+        confirmation_intent_llm_min_confidence=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(os.getenv("AGENT_CONFIRMATION_LLM_MIN_CONFIDENCE"), 0.72),
+            ),
         ),
         supabase_url=(os.getenv("SUPABASE_URL") or None),
         supabase_anon_key=(os.getenv("SUPABASE_ANON_KEY") or None),

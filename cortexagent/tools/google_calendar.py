@@ -203,7 +203,11 @@ def _is_create_intent(text: str) -> bool:
         "book meeting",
         "set up meeting",
         "put on my calendar",
+        "put on calendar",
         "add to my calendar",
+        "add it to my calendar",
+        "add it to calendar",
+        "add to calendar",
     )
     if any(term in lowered for term in create_terms):
         return True
@@ -213,7 +217,23 @@ def _is_create_intent(text: str) -> bool:
     has_calendar_ref = "calendar" in lowered
     has_event_ref = bool(re.search(r"\b(meeting|event|appointment|call)\b", lowered))
     has_pronoun_ref = bool(re.search(r"\b(it|this|that)\b", lowered))
-    if has_write_verb and has_calendar_ref and (has_event_ref or has_pronoun_ref):
+    has_temporal_ref = bool(
+        re.search(
+            r"\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            lowered,
+        )
+        or re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", lowered)
+        or re.search(
+            r"\b(?:"
+            r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+            r")\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b"
+            r"|"
+            r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
+            lowered,
+        )
+    )
+    if has_write_verb and has_calendar_ref and (has_event_ref or has_pronoun_ref or has_temporal_ref):
         return True
     pattern = re.compile(
         r"\b(add|ad|create|schedule|book|set up)\b.*\b(meeting|event|appointment)\b"

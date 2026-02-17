@@ -139,6 +139,14 @@ class GoogleGmailFlowTests(unittest.TestCase):
         )
         self.assertEqual(result.action, "google_gmail")
 
+    def test_router_picks_google_gmail_for_reply_to_phrase_in_degraded_mode(self):
+        result = decide_action(
+            user_text="can you reply to the sender from example corp and let them know I appreciate the help",
+            tools_enabled=True,
+            web_search_enabled=False,
+        )
+        self.assertEqual(result.action, "google_gmail")
+
     def test_router_picks_google_drive(self):
         result = decide_action(
             user_text="find file roadmap in my google drive",
@@ -146,6 +154,14 @@ class GoogleGmailFlowTests(unittest.TestCase):
             web_search_enabled=True,
         )
         self.assertEqual(result.action, "google_drive")
+
+    def test_router_does_not_confuse_everyday_drive_phrase_with_google_drive(self):
+        result = decide_action(
+            user_text="thanks! im going on a drive now...cya later",
+            tools_enabled=True,
+            web_search_enabled=False,
+        )
+        self.assertEqual(result.action, "chat")
 
     def test_router_picks_google_gmail_for_typo_send_email_phrase(self):
         result = decide_action(

@@ -99,7 +99,6 @@ GOOGLE_GMAIL_TERMS = (
 
 GOOGLE_DRIVE_TERMS = (
     "google drive",
-    "drive",
     "my files",
     "shared with me",
     "find file",
@@ -292,9 +291,14 @@ def _matches_explicit_calendar_write_intent(text: str) -> bool:
 def _matches_explicit_gmail_intent(text: str) -> bool:
     if not text:
         return False
+    reply_intent = bool(
+        re.search(r"\breply\s+to\b", text)
+        and not re.search(r"\bhow\s+to\s+reply\s+to\b", text)
+    )
     return bool(
         re.search(r"\b(read|open|show|list|check)\b.*\b(email|inbox|thread|message)\b", text)
         or re.search(r"\b(draft|compose|write)\b.*\b(reply|email)\b", text)
+        or reply_intent
         or re.search(r"\bsend\b.*\b(email|gmail|message)\b", text)
         or re.search(r"\b(sned|snd)\b.*\b(email|gmail|message)\b", text)
         or re.search(r"\bsend\b.*\bdraft\b", text)
