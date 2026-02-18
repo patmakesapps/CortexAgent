@@ -2,6 +2,27 @@
 
 CortexAgent is a modular orchestration layer that sits between `CortexUI` and `CortexLTM`.
 
+## Refactor Status (Feb 18, 2026)
+
+This repo was intentionally simplified to prepare for a full agent schema rebuild.
+
+Current state:
+- Removed agentic runtime and routing stack (orchestrator/planner/router/main API entrypoint).
+- Removed web-search agent flow and old agent test suite.
+- Kept Google integration foundations so reconnection work is not lost:
+  - `cortexagent/services/google_oauth.py`
+  - `cortexagent/services/connected_accounts_repo.py`
+  - `cortexagent/services/supabase_auth.py`
+  - `cortexagent/services/token_security.py`
+  - `cortexagent/tools/google_calendar.py`
+  - `cortexagent/tools/google_gmail.py`
+  - `cortexagent/tools/google_drive.py`
+
+Important:
+- `CortexAgent` does not currently expose a running FastAPI app (`cortexagent/main.py` was removed).
+- `CortexUI` can still run against `CortexLTM` in memory-only mode while the agent runtime is rebuilt.
+- Parts of this README below are historical v1 documentation and will be replaced during the rebuild.
+
 v1 goal:
 - Route normal chat to CortexLTM
 - Trigger web search when the user asks for current/external information

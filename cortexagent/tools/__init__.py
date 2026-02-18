@@ -3,7 +3,6 @@ from .google_calendar import GoogleCalendarTool
 from .google_drive import GoogleDriveTool
 from .google_gmail import GoogleGmailTool
 from .registry import ToolRegistry
-from .web_search import WebSearchTool
 
 __all__ = [
     "Tool",
@@ -14,5 +13,4 @@ __all__ = [
     "ToolResult",
     "ToolResultItem",
     "ToolRegistry",
-    "WebSearchTool",
 ]

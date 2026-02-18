@@ -85,10 +85,7 @@ def load_settings() -> Settings:
         or os.getenv("GROQ_CHAT_MODEL")
         or "llama-3.1-8b-instant"
     )
-    planner_model = (
-        os.getenv("AGENT_PLANNER_LLM_MODEL")
-        or router_model
-    )
+    planner_model = os.getenv("AGENT_PLANNER_LLM_MODEL") or router_model
     return Settings(
         cortexltm_api_base_url=os.getenv(
             "CORTEXLTM_API_BASE_URL", "http://127.0.0.1:8000"
@@ -103,25 +100,25 @@ def load_settings() -> Settings:
         web_search_retries=_as_int(os.getenv("WEB_SEARCH_RETRIES"), 2),
         groq_api_key=(os.getenv("GROQ_API_KEY") or None),
         router_llm_enabled=_as_bool(os.getenv("AGENT_ROUTER_LLM_ENABLED"), True),
-        router_llm_provider=os.getenv("AGENT_ROUTER_LLM_PROVIDER", "groq").strip().lower(),
+        router_llm_provider=os.getenv("AGENT_ROUTER_LLM_PROVIDER", "groq")
+        .strip()
+        .lower(),
         router_llm_model=router_model,
         router_llm_api_base_url=(os.getenv("AGENT_ROUTER_LLM_API_BASE_URL") or None),
         router_llm_api_key=(
-            os.getenv("AGENT_ROUTER_LLM_API_KEY")
-            or os.getenv("GROQ_API_KEY")
-            or None
+            os.getenv("AGENT_ROUTER_LLM_API_KEY") or os.getenv("GROQ_API_KEY") or None
         ),
         router_llm_timeout_seconds=_as_int(
             os.getenv("AGENT_ROUTER_LLM_TIMEOUT_SECONDS"), 6
         ),
         planner_llm_enabled=_as_bool(os.getenv("AGENT_PLANNER_LLM_ENABLED"), True),
-        planner_llm_provider=os.getenv("AGENT_PLANNER_LLM_PROVIDER", "groq").strip().lower(),
+        planner_llm_provider=os.getenv("AGENT_PLANNER_LLM_PROVIDER", "groq")
+        .strip()
+        .lower(),
         planner_llm_model=planner_model,
         planner_llm_api_base_url=(os.getenv("AGENT_PLANNER_LLM_API_BASE_URL") or None),
         planner_llm_api_key=(
-            os.getenv("AGENT_PLANNER_LLM_API_KEY")
-            or os.getenv("GROQ_API_KEY")
-            or None
+            os.getenv("AGENT_PLANNER_LLM_API_KEY") or os.getenv("GROQ_API_KEY") or None
         ),
         planner_llm_timeout_seconds=_as_int(
             os.getenv("AGENT_PLANNER_LLM_TIMEOUT_SECONDS"), 8
@@ -138,8 +135,7 @@ def load_settings() -> Settings:
             ),
         ),
         agent_decision_mode=(
-            os.getenv("AGENT_DECISION_MODE", "llm_only").strip().lower()
-            or "llm_only"
+            os.getenv("AGENT_DECISION_MODE", "llm_only").strip().lower() or "llm_only"
         ),
         confirmation_intent_llm_enabled=_as_bool(
             os.getenv("AGENT_CONFIRMATION_LLM_ENABLED"), True
@@ -169,7 +165,9 @@ def load_settings() -> Settings:
         google_oauth_timeout_seconds=_as_int(
             os.getenv("GOOGLE_OAUTH_TIMEOUT_SECONDS"), 8
         ),
-        gmail_allowed_recipient_domains=os.getenv("GMAIL_ALLOWED_RECIPIENT_DOMAINS", ""),
+        gmail_allowed_recipient_domains=os.getenv(
+            "GMAIL_ALLOWED_RECIPIENT_DOMAINS", ""
+        ),
     )
 
 
