@@ -4,12 +4,18 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from cortexagent.router.intent_router import decide_action
-from cortexagent.services.connected_accounts_repo import ConnectedAccount, ResolvedProviderToken
+from cortexagent.services.connected_accounts_repo import (
+    ConnectedAccount,
+    ResolvedProviderToken,
+)
 from cortexagent.services.google_oauth import GoogleTokenExchange
 from cortexagent.services.orchestrator import (
     AgentOrchestrator,
+    PendingAction,
     _build_confirmed_calendar_request,
+    _extract_calendar_fields,
     _looks_like_ad_source,
+    _prevent_unexecuted_action_claims,
 )
 from cortexagent.tools.base import Tool, ToolContext, ToolResult, ToolResultItem
 from cortexagent.tools.registry import ToolRegistry
@@ -38,9 +44,7 @@ class _FailingLtmClient:
 class _LyingLtmClient:
     def chat(self, thread_id, text, short_term_limit, authorization):
         _ = (thread_id, text, short_term_limit, authorization)
-        return (
-            "I've added your meeting to your calendar and set a reminder for Monday at 5:00 PM."
-        )
+        return "I've added your meeting to your calendar and set a reminder for Monday at 5:00 PM."
 
     def add_event(self, thread_id, actor, content, meta, authorization):
         _ = (thread_id, actor, content, meta, authorization)
@@ -391,7 +395,10 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         self.assertEqual(second.decision.action, "google_calendar")
         self.assertIn(
             second.decision.reason,
-            {"calendar_context_followup", "matched_explicit_google_calendar_write_intent"},
+            {
+                "calendar_context_followup",
+                "matched_explicit_google_calendar_write_intent",
+            },
         )
 
     def test_orchestrator_routes_move_it_followup_to_recent_calendar_tool(self):
@@ -445,7 +452,10 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         self.assertEqual(second.decision.action, "google_calendar")
         self.assertIn(
             second.decision.reason,
-            {"calendar_context_followup", "matched_explicit_google_calendar_write_intent"},
+            {
+                "calendar_context_followup",
+                "matched_explicit_google_calendar_write_intent",
+            },
         )
 
     def test_orchestrator_returns_reauth_message_when_refresh_fails(self):
@@ -571,7 +581,10 @@ class GoogleCalendarFlowTests(unittest.TestCase):
 
         self.assertIn("Should I add this to Google Calendar?", first.response)
         self.assertIn("Google Calendar updated", second.response)
-        self.assertIn("Link: https://calendar.google.com/calendar/event?eid=test-created-1", second.response)
+        self.assertIn(
+            "Link: https://calendar.google.com/calendar/event?eid=test-created-1",
+            second.response,
+        )
 
     def test_orchestrator_accepts_plain_confirm_for_calendar_draft(self):
         account = _active_account()
@@ -833,7 +846,10 @@ class GoogleCalendarFlowTests(unittest.TestCase):
 
         self.assertIn("Should I add this to Google Calendar?", first.response)
         self.assertIn("Google Calendar updated", second.response)
-        self.assertIn("Link: https://calendar.google.com/calendar/event?eid=test-created-1", second.response)
+        self.assertIn(
+            "Link: https://calendar.google.com/calendar/event?eid=test-created-1",
+            second.response,
+        )
 
     def test_build_confirmed_request_expands_plain_confirm_with_explicit_fields(self):
         draft = (
@@ -845,7 +861,9 @@ class GoogleCalendarFlowTests(unittest.TestCase):
             "Should I add this to Google Calendar? "
             "Reply with 'confirm' to proceed or 'cancel' to stop."
         )
-        merged = _build_confirmed_calendar_request(draft_text=draft, followup_text="confirm")
+        merged = _build_confirmed_calendar_request(
+            draft_text=draft, followup_text="confirm"
+        )
         self.assertTrue(merged.lower().startswith("confirm: add event "))
         self.assertIn("Meeting with John From CompanyX", merged)
         self.assertIn("on Wednesday, Feb 18, 2026", merged)
@@ -868,7 +886,9 @@ class GoogleCalendarFlowTests(unittest.TestCase):
             authorization=None,
         )
         self.assertNotIn("I've added your meeting to your calendar", result.response)
-        self.assertIn("I haven’t added anything to your Google Calendar yet.", result.response)
+        self.assertIn(
+            "I haven’t added anything to your Google Calendar yet.", result.response
+        )
 
     def test_orchestrator_blocks_gmail_send_claims_without_gmail_tool(self):
         registry = ToolRegistry()
@@ -889,8 +909,16 @@ class GoogleCalendarFlowTests(unittest.TestCase):
         self.assertIn("I haven’t sent an email yet.", result.response)
 
     def test_source_filter_rejects_generic_search_homepages(self):
-        self.assertTrue(_looks_like_ad_source("Google: Search the world's information", "https://www.google.com/"))
-        self.assertTrue(_looks_like_ad_source("Yandex - fast Internet search", "https://yandex.com/"))
+        self.assertTrue(
+            _looks_like_ad_source(
+                "Google: Search the world's information", "https://www.google.com/"
+            )
+        )
+        self.assertTrue(
+            _looks_like_ad_source(
+                "Yandex - fast Internet search", "https://yandex.com/"
+            )
+        )
 
     def test_orchestrator_handles_calendar_day_correction_before_ok(self):
         account = _active_account()
@@ -951,6 +979,126 @@ class GoogleCalendarFlowTests(unittest.TestCase):
             "Link: https://calendar.google.com/calendar/event?eid=created-jim-1",
             third.response,
         )
+
+    def test_extract_calendar_fields_ignores_to_my_schedule_tail_in_title(self):
+        fields = _extract_calendar_fields(
+            "add my meeting with dale to my schedule and set it for 1am on friday"
+        )
+        self.assertEqual(fields.get("title"), "Meeting with Dale")
+        self.assertEqual(fields.get("day"), "friday")
+        self.assertEqual(fields.get("time"), "1am")
+
+    def test_pending_status_questions_return_count_and_followup_single_after_cancel(
+        self,
+    ):
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=ToolRegistry(),
+            connected_accounts_repo=None,  # type: ignore[arg-type]
+            google_oauth=None,  # type: ignore[arg-type]
+        )
+        orchestrator._pending_actions_by_thread["thread-pending-status"] = [
+            PendingAction(
+                pending_action_id="pa_8f294a5202a3",
+                thread_id="thread-pending-status",
+                action="google_calendar",
+                operation="read",
+                args={"event_text": "check my calendar drafts"},
+                query="check my calendar drafts",
+                expected_outcome="calendar_read",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                status="pending",
+            )
+        ]
+
+        first = orchestrator.handle_chat(
+            thread_id="thread-pending-status",
+            text="how many total drafts?",
+            short_term_limit=30,
+            authorization=None,
+        )
+        self.assertIn("You currently have 1 pending action", first.response)
+        self.assertIn("Pending actions waiting for confirmation:", first.response)
+
+        cancel = orchestrator.handle_chat(
+            thread_id="thread-pending-status",
+            text="cancel",
+            short_term_limit=30,
+            authorization=None,
+        )
+        self.assertIn("Canceled the pending action request.", cancel.response)
+
+        followup = orchestrator.handle_chat(
+            thread_id="thread-pending-status",
+            text="was that the only one?",
+            short_term_limit=30,
+            authorization=None,
+        )
+        self.assertIn("Yes, that was the only pending action", followup.response)
+        self.assertEqual(followup.decision.reason, "pending_action_status_no_pending")
+
+    def test_extract_calendar_fields_parses_kids_birthday_and_compact_time(self):
+        fields = _extract_calendar_fields(
+            "add my kids birthday party to calendar for 1030 am on sunday"
+        )
+        self.assertEqual(fields.get("title"), "My Kids Birthday Party")
+        self.assertEqual(fields.get("day"), "sunday")
+        self.assertEqual(fields.get("time"), "1030am")
+
+    def test_pending_calendar_does_not_block_new_calendar_read_request(self):
+        orchestrator = AgentOrchestrator(
+            ltm_client=_FakeLtmClient(),
+            tool_registry=ToolRegistry(),
+            connected_accounts_repo=None,  # type: ignore[arg-type]
+            google_oauth=None,  # type: ignore[arg-type]
+        )
+        orchestrator._pending_actions_by_thread["thread-pending-read"] = [
+            PendingAction(
+                pending_action_id="pa_read_12345",
+                thread_id="thread-pending-read",
+                action="google_calendar",
+                operation="create",
+                args={"event_text": "add event Meeting on sunday"},
+                query="add event Meeting on sunday",
+                expected_outcome="calendar_write",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                status="pending",
+            )
+        ]
+
+        response = orchestrator.handle_chat(
+            thread_id="thread-pending-read",
+            text="can you check my schedule for the month",
+            short_term_limit=30,
+            authorization=None,
+        )
+        self.assertNotIn(
+            "still have pending actions waiting for confirmation",
+            response.response.lower(),
+        )
+        self.assertIn("check my calendar events based on this request", response.response.lower())
+
+    def test_prevent_unexecuted_action_claims_blocks_fabricated_calendar_reads(self):
+        fake = (
+            "You have the following events and deadlines\n"
+            "1. Meeting: Client Meeting, Wednesday, 2 PM EST\n"
+            "2. Task: Complete Marketing Strategy Review by February 25th\n"
+            "I've also noted recurring tasks."
+        )
+        safe = _prevent_unexecuted_action_claims(
+            assistant_text=fake,
+            routed_action="chat",
+            user_text="whats on my schedule for this month",
+        )
+        self.assertIn("can’t verify live calendar events", safe.lower())
+
+    def test_prevent_unexecuted_action_claims_strictly_blocks_calendar_read_when_not_routed(self):
+        response = _prevent_unexecuted_action_claims(
+            assistant_text="Your schedule for this month includes multiple meetings.",
+            routed_action="chat",
+            user_text="whats on my schedule for this month",
+        )
+        self.assertIn("can’t provide live calendar results", response.lower())
 
 
 if __name__ == "__main__":

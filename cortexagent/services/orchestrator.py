@@ -92,6 +92,7 @@ class AgentOrchestrator:
         self._last_non_meta_user_text_by_thread: dict[str, str] = {}
         self._last_web_search_query_by_thread: dict[str, str] = {}
         self._last_pipeline_results_by_thread: dict[str, list[dict[str, object]]] = {}
+        self._last_cleared_pending_count_by_thread: dict[str, int] = {}
 
     def handle_chat(
         self,
@@ -124,10 +125,22 @@ class AgentOrchestrator:
                 pending_action_id=pending_action_id,
             )
             selected_ids = {action.pending_action_id for action in selected_actions}
+            if _looks_like_pending_status_query(text):
+                return OrchestratorResult(
+                    response=_render_pending_actions_status(pending_actions=pending_actions),
+                    decision=AgentDecision(
+                        action="orchestration",
+                        reason="pending_action_status",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
             if pending_intent.intent == "cancel":
                 self._pending_actions_by_thread[thread_id] = [
                     action for action in pending_actions if action.pending_action_id not in selected_ids
                 ]
+                if selected_ids:
+                    self._last_cleared_pending_count_by_thread[thread_id] = len(selected_ids)
                 return OrchestratorResult(
                     response="Canceled the pending action request.",
                     decision=AgentDecision(
@@ -174,6 +187,8 @@ class AgentOrchestrator:
                 self._pending_actions_by_thread[thread_id] = [
                     action for action in pending_actions if action.pending_action_id not in selected_ids
                 ]
+                if selected_ids:
+                    self._last_cleared_pending_count_by_thread[thread_id] = len(selected_ids)
                 return self._run_multi_step_pipeline(
                     thread_id=thread_id,
                     text=text,
@@ -187,14 +202,32 @@ class AgentOrchestrator:
                         "fallback_reason": None,
                     },
                 )
+            if not _looks_like_new_request_while_pending(
+                text=text,
+                pending_intent=pending_intent.intent,
+            ):
+                return OrchestratorResult(
+                    response=(
+                        "I still have pending actions waiting for confirmation.\n\n"
+                        + _render_pending_actions_message(pending_actions)
+                    ),
+                    decision=AgentDecision(
+                        action="orchestration",
+                        reason="pending_action_waiting_confirmation",
+                        confidence=1.0,
+                    ),
+                    sources=[],
+                )
+        if _looks_like_pending_status_query(text):
+            last_count = self._last_cleared_pending_count_by_thread.get(thread_id)
             return OrchestratorResult(
-                response=(
-                    "I still have pending actions waiting for confirmation.\n\n"
-                    + _render_pending_actions_message(pending_actions)
+                response=_render_no_pending_status(
+                    text=text,
+                    last_cleared_count=last_count,
                 ),
                 decision=AgentDecision(
                     action="orchestration",
-                    reason="pending_action_waiting_confirmation",
+                    reason="pending_action_status_no_pending",
                     confidence=1.0,
                 ),
                 sources=[],
@@ -345,6 +378,7 @@ class AgentOrchestrator:
         assistant_text = _prevent_unexecuted_action_claims(
             assistant_text=assistant_text,
             routed_action="chat",
+            user_text=text,
         )
         return OrchestratorResult(
             response=assistant_text,
@@ -2039,6 +2073,18 @@ def _looks_like_calendar_write_request(text: str) -> bool:
         return False
     if re.search(r"\badd\s+it\s+to\s+my\s+calendar\b", text):
         return True
+    explicit_read_query = bool(
+        re.search(r"\b(check|show|list|view|see|what(?:'s| is)|when)\b", text)
+        and re.search(r"\b(calendar|schedule|events?|meetings?)\b", text)
+    )
+    explicit_write_query = bool(
+        re.search(
+            r"\b(add|ad|create|schedule|book|set up|put|reschedule|move|shift|update|change|remind)\b",
+            text,
+        )
+    )
+    if explicit_read_query and not explicit_write_query:
+        return False
     has_write_verb = bool(
         re.search(
             r"\b(add|ad|create|schedule|book|set up|put|reschedule|move|shift|update|change|remind)\b",
@@ -2101,11 +2147,11 @@ def _build_step_query(action: str, user_text: str, expected_outcome: str) -> str
             if cleaned:
                 return cleaned
             return user_text.strip()
-        if re.search(r"\b(create|schedule|meeting|event|reschedule|move|time|availability)\b", lowered):
+        if re.search(r"\b(create|add|reschedule|move|update|book|set up)\b", lowered):
             return f"schedule or update a calendar event based on this request: {user_text.strip()}"
         if "remind" in lowered:
             return f"add a reminder event based on this request: {user_text.strip()}"
-        return "check my calendar and propose times"
+        return f"check my calendar events based on this request: {user_text.strip()}"
     return user_text.strip()
 
 
@@ -2192,7 +2238,7 @@ def _pending_action_from_step_result(
             pending_action_id=f"pa_{uuid4().hex[:12]}",
             thread_id=thread_id,
             action="google_calendar",
-            operation=(step.operation or "read").strip().lower() or "read",
+            operation=(step.operation or "create").strip().lower() or "create",
             args=pending_args,
             query=step.query,
             expected_outcome="calendar_write",
@@ -2254,7 +2300,7 @@ def _build_confirmed_step_from_pending(
                 draft_text=draft_text,
                 followup_text=followup_text,
             )
-            operation = "read"
+            operation = "create"
             expected_outcome = "calendar_write"
         elif expected_outcome == "calendar_write":
             operation = "create"
@@ -2637,12 +2683,25 @@ def _extract_calendar_fields(text: str) -> dict[str, str]:
         if title_override:
             out["title"] = _title_case_words(title_override.group(1))
         else:
-            with_match = re.search(
-                r"\bwith\s+([a-z][a-z\s'-]{1,50}?)(?=\s+(?:on|at|in|and|for|its|it'?s|please|add|create|schedule|book)\b|[,.!?]|$)",
+            add_title_match = re.search(
+                r"\b(?:add|create|schedule|book|put)\s+(?:an?\s+)?(?:event\s+)?(.+?)(?=\s+(?:to\s+(?:my\s+)?calendar|to\s+(?:my|the)\s+schedule|on|at|for|in)\b|[,.!?]|$)",
                 lowered,
             )
-            if with_match:
-                out["title"] = "Meeting with " + _title_case_words(with_match.group(1))
+            if add_title_match:
+                candidate = add_title_match.group(1).strip()
+                if candidate.startswith("my meeting with "):
+                    out["title"] = "Meeting with " + _title_case_words(
+                        candidate[len("my meeting with ") :]
+                    )
+                else:
+                    out["title"] = _title_case_words(candidate)
+            else:
+                with_match = re.search(
+                    r"\bwith\s+([a-z][a-z\s'-]{1,50}?)(?=\s+(?:on|at|in|and|for|its|it'?s|please|add|create|schedule|book)\b|\s+to\s+(?:my|the)\s+(?:calendar|schedule)\b|[,.!?]|$)",
+                    lowered,
+                )
+                if with_match:
+                    out["title"] = "Meeting with " + _title_case_words(with_match.group(1))
 
     if "day" not in out:
         day_match = re.search(
@@ -2666,7 +2725,7 @@ def _extract_calendar_fields(text: str) -> dict[str, str]:
                 out["day"] = date_match.group(0)
 
     if "time" not in out:
-        time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lowered)
+        time_match = re.search(r"\b(\d{1,4}(?::\d{2})?\s*(?:am|pm))\b", lowered)
         if time_match:
             out["time"] = time_match.group(1).replace(" ", "")
 
@@ -2900,6 +2959,60 @@ def _render_pending_actions_message(pending_actions: list[PendingAction]) -> str
     return "\n".join(lines)
 
 
+def _render_pending_actions_status(*, pending_actions: list[PendingAction]) -> str:
+    count = len(pending_actions)
+    noun = "action" if count == 1 else "actions"
+    lines = [f"You currently have {count} pending {noun} waiting for confirmation."]
+    lines.append("")
+    lines.append(_render_pending_actions_message(pending_actions))
+    return "\n".join(lines).strip()
+
+
+def _looks_like_pending_status_query(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    if re.search(r"\b(how many|count|total|pending|drafts?|only one|just one|was that)\b", lowered):
+        return True
+    return False
+
+
+def _looks_like_new_request_while_pending(*, text: str, pending_intent: str) -> bool:
+    if pending_intent != "unknown":
+        return False
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    asks_calendar_read = bool(
+        re.search(r"\b(check|show|list|what|when|view|look|see)\b", lowered)
+        and re.search(r"\b(calendar|schedule|events?|meetings?)\b", lowered)
+    )
+    asks_time_range = bool(
+        re.search(r"\b(today|tomorrow|week|month|this month|next month|upcoming)\b", lowered)
+        and re.search(r"\b(calendar|schedule|events?|meetings?)\b", lowered)
+    )
+    return asks_calendar_read or asks_time_range
+
+
+def _render_no_pending_status(*, text: str, last_cleared_count: int | None) -> str:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    asks_single = bool(re.search(r"\b(only one|just one|was that the only one|so just one)\b", lowered))
+    if asks_single and last_cleared_count is not None:
+        if last_cleared_count == 1:
+            return "Yes, that was the only pending action, and it is now cleared."
+        return (
+            f"No. There were {last_cleared_count} pending actions in that set, "
+            "and they are now cleared."
+        )
+    if last_cleared_count is not None:
+        noun = "action" if last_cleared_count == 1 else "actions"
+        return (
+            "There are no pending actions waiting for confirmation right now. "
+            f"The last cleared set had {last_cleared_count} pending {noun}."
+        )
+    return "There are no pending actions waiting for confirmation right now."
+
+
 def _derive_step_args(step: OrchestrationStep) -> dict[str, object]:
     action = (step.action or "").strip().lower()
     query = (step.query or "").strip()
@@ -2913,12 +3026,34 @@ def _derive_step_args(step: OrchestrationStep) -> dict[str, object]:
     return {}
 
 
-def _prevent_unexecuted_action_claims(assistant_text: str, routed_action: str) -> str:
+def _prevent_unexecuted_action_claims(
+    assistant_text: str, routed_action: str, user_text: str = ""
+) -> str:
     if routed_action in {"google_calendar", "google_gmail", "google_drive"}:
         return assistant_text
     lowered = (assistant_text or "").strip().lower()
     if not lowered:
         return assistant_text
+    lowered_user = (user_text or "").strip().lower()
+    strict_calendar_read_request = bool(
+        re.search(r"\b(calendar|schedule|agenda|events?|meetings?)\b", lowered_user)
+        and re.search(
+            r"\b(check|show|list|what|when|month|week|today|tomorrow|upcoming|agenda)\b",
+            lowered_user,
+        )
+    )
+    asks_calendar_read = bool(
+        re.search(r"\b(calendar|schedule|events?|meetings?)\b", lowered_user)
+        and re.search(r"\b(check|show|list|what|when|month|week|today|tomorrow|upcoming)\b", lowered_user)
+    )
+    likely_fabricated_calendar_read = bool(
+        re.search(
+            r"\byou have (?:the )?following (?:events|deadlines|tasks)\b",
+            lowered,
+        )
+        or re.search(r"\brecurring (?:event|tasks?)\b", lowered)
+        or re.search(r"^\s*\d+\.\s*(meeting|task|deadline|event)\b", lowered, re.MULTILINE)
+    )
     calendar_claim = "calendar" in lowered and bool(
         re.search(
             r"\b(i(?:'ve| have)?\s+(added|scheduled|booked|put)|it(?:'s| is)\s+added|added your)\b",
@@ -2935,6 +3070,16 @@ def _prevent_unexecuted_action_claims(assistant_text: str, routed_action: str) -
         return (
             "I haven’t added anything to your Google Calendar yet. "
             "I can do that through the calendar tool now if you want."
+        )
+    if strict_calendar_read_request:
+        return (
+            "I can’t provide live calendar results from memory-only mode. "
+            "I need to run Google Calendar to list your real schedule."
+        )
+    if asks_calendar_read and likely_fabricated_calendar_read:
+        return (
+            "I can’t verify live calendar events from memory-only mode. "
+            "I need to run Google Calendar to list your real schedule."
         )
     if gmail_claim:
         return (
