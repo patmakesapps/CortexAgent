@@ -19,7 +19,9 @@ class GoogleGmailTool(Tool):
         tool_meta = context.tool_meta or {}
         access_token = str(tool_meta.get("access_token") or "").strip()
         if not access_token:
-            raise RuntimeError("Google account is not connected. Please connect Google first.")
+            raise RuntimeError(
+                "Google account is not connected. Please connect Google first."
+            )
 
         operation = str(tool_meta.get("operation") or "read").strip().lower()
         args = tool_meta.get("args") if isinstance(tool_meta.get("args"), dict) else {}
@@ -31,7 +33,9 @@ class GoogleGmailTool(Tool):
             if not draft_id:
                 raise RuntimeError("Missing draft_id for Gmail send operation.")
             sent = self._send_draft(access_token=access_token, draft_id=draft_id)
-            return ToolResult(tool_name=self.name, query=context.user_text, items=[sent])
+            return ToolResult(
+                tool_name=self.name, query=context.user_text, items=[sent]
+            )
 
         if operation == "draft_new":
             to_addr = str((args or {}).get("to") or "").strip()
@@ -45,27 +49,37 @@ class GoogleGmailTool(Tool):
                 subject=subject or "(no subject)",
                 body=body,
             )
-            return ToolResult(tool_name=self.name, query=context.user_text, items=[drafted])
+            return ToolResult(
+                tool_name=self.name, query=context.user_text, items=[drafted]
+            )
 
         if operation == "draft_reply":
             thread_id = str((args or {}).get("thread_id") or "").strip()
             body = str((args or {}).get("body") or "").strip()
             if not thread_id or not body:
-                raise RuntimeError("Missing required args for draft_reply: thread_id, body.")
+                raise RuntimeError(
+                    "Missing required args for draft_reply: thread_id, body."
+                )
             drafted = self._draft_reply(
                 access_token=access_token,
                 thread_id=thread_id,
                 body=body,
             )
-            return ToolResult(tool_name=self.name, query=context.user_text, items=[drafted])
+            return ToolResult(
+                tool_name=self.name, query=context.user_text, items=[drafted]
+            )
 
         if operation in {"read_message", "read_thread"}:
             thread_id = str((args or {}).get("thread_id") or "").strip()
             if not thread_id:
                 raise RuntimeError("Missing thread_id for read_message operation.")
-            details = self._get_thread_details(access_token=access_token, thread_id=thread_id)
+            details = self._get_thread_details(
+                access_token=access_token, thread_id=thread_id
+            )
             item = self._build_thread_item(thread_id=thread_id, details=details)
-            return ToolResult(tool_name=self.name, query=context.user_text, items=[item])
+            return ToolResult(
+                tool_name=self.name, query=context.user_text, items=[item]
+            )
 
         threads = self._list_recent_threads(
             access_token=access_token,
@@ -110,11 +124,15 @@ class GoogleGmailTool(Tool):
             thread_id = str(row.get("id") or "").strip()
             if not thread_id:
                 continue
-            details = self._get_thread_details(access_token=access_token, thread_id=thread_id)
+            details = self._get_thread_details(
+                access_token=access_token, thread_id=thread_id
+            )
             out.append(self._build_thread_item(thread_id=thread_id, details=details))
         return out
 
-    def _build_thread_item(self, *, thread_id: str, details: dict[str, str]) -> ToolResultItem:
+    def _build_thread_item(
+        self, *, thread_id: str, details: dict[str, str]
+    ) -> ToolResultItem:
         subject = details.get("subject") or "(no subject)"
         sender = details.get("from") or "Unknown sender"
         snippet = details.get("body") or "(empty body)"
@@ -124,7 +142,9 @@ class GoogleGmailTool(Tool):
             snippet=f"From: {sender}\n\n{snippet}".strip(),
         )
 
-    def _get_thread_details(self, *, access_token: str, thread_id: str) -> dict[str, str]:
+    def _get_thread_details(
+        self, *, access_token: str, thread_id: str
+    ) -> dict[str, str]:
         payload = _api_request_json(
             url=f"{self.THREADS_URL}/{thread_id}?format=full",
             access_token=access_token,
@@ -139,13 +159,19 @@ class GoogleGmailTool(Tool):
         parsed = _extract_message_fields(latest)
         return parsed
 
-    def _draft_reply(self, *, access_token: str, thread_id: str, body: str) -> ToolResultItem:
-        details = self._get_thread_details(access_token=access_token, thread_id=thread_id)
+    def _draft_reply(
+        self, *, access_token: str, thread_id: str, body: str
+    ) -> ToolResultItem:
+        details = self._get_thread_details(
+            access_token=access_token, thread_id=thread_id
+        )
         to_addr = details.get("reply_to") or details.get("from_email") or ""
         if not to_addr:
             raise RuntimeError("Could not infer reply recipient from thread.")
         subject = details.get("subject") or "(no subject)"
-        raw = _build_email_rfc822_raw(to_addr=to_addr, subject=_reply_subject(subject), body=body)
+        raw = _build_email_rfc822_raw(
+            to_addr=to_addr, subject=_reply_subject(subject), body=body
+        )
         payload = {
             "message": {
                 "raw": raw,
@@ -158,7 +184,9 @@ class GoogleGmailTool(Tool):
             method="POST",
             body=payload,
         )
-        draft_id = str(created.get("id") or "").strip() if isinstance(created, dict) else ""
+        draft_id = (
+            str(created.get("id") or "").strip() if isinstance(created, dict) else ""
+        )
         if not draft_id:
             raise RuntimeError("Gmail returned an unexpected draft payload.")
         return ToolResultItem(
@@ -183,7 +211,9 @@ class GoogleGmailTool(Tool):
             method="POST",
             body=payload,
         )
-        draft_id = str(created.get("id") or "").strip() if isinstance(created, dict) else ""
+        draft_id = (
+            str(created.get("id") or "").strip() if isinstance(created, dict) else ""
+        )
         if not draft_id:
             raise RuntimeError("Gmail returned an unexpected draft payload.")
         return ToolResultItem(
@@ -199,13 +229,19 @@ class GoogleGmailTool(Tool):
             method="POST",
             body={"id": draft_id},
         )
-        thread_id = str(payload.get("threadId") or "").strip() if isinstance(payload, dict) else ""
+        thread_id = (
+            str(payload.get("threadId") or "").strip()
+            if isinstance(payload, dict)
+            else ""
+        )
         link = (
             f"https://mail.google.com/mail/u/0/#inbox/{thread_id}"
             if thread_id
             else "https://mail.google.com/mail/u/0/#inbox"
         )
-        return ToolResultItem(title="[Sent] Draft delivered", url=link, snippet=f"Draft id: {draft_id}")
+        return ToolResultItem(
+            title="[Sent] Draft delivered", url=link, snippet=f"Draft id: {draft_id}"
+        )
 
 
 def _api_request_json(
