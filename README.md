@@ -1,198 +1,116 @@
 # CortexAgent
 
-CortexAgent is a modular orchestration layer that sits between `CortexUI` and `CortexLTM`.
+CortexAgent is the orchestration layer between `CortexUI` and `CortexLTM`.
 
-## Refactor Status (Feb 18, 2026)
+## Runtime Architecture
 
-This repo was intentionally simplified to prepare for a full agent schema rebuild.
+The runtime is intentionally LLM-first and split into explicit layers:
 
-Current state:
-- Removed agentic runtime and routing stack (orchestrator/planner/router/main API entrypoint).
-- Removed web-search agent flow and old agent test suite.
-- Kept Google integration foundations so reconnection work is not lost:
-  - `cortexagent/services/google_oauth.py`
-  - `cortexagent/services/connected_accounts_repo.py`
-  - `cortexagent/services/supabase_auth.py`
-  - `cortexagent/services/token_security.py`
-  - `cortexagent/tools/google_calendar.py`
-  - `cortexagent/tools/google_gmail.py`
-  - `cortexagent/tools/google_drive.py`
+- `planner` (`cortexagent/services/planner.py`)
+  - Reads full conversation context.
+  - Outputs a strict structured decision:
+    - `direct_response`
+    - `tool_pipeline` (ordered tool steps + args)
+- `executor` (`cortexagent/services/executor.py`)
+  - Deterministically executes planner steps.
+  - Never infers intent or mutates plan decisions.
+- `tool registry` (`cortexagent/tools/registry.py`)
+  - Holds tool schema + metadata.
+  - Validates planner args before execution.
+- `orchestrator` (`cortexagent/services/orchestrator.py`)
+  - Coordinates planner + executor + persistence.
+- `api` (`cortexagent/main.py`)
+  - FastAPI routes consumed by CortexUI.
 
-Important:
-- `CortexAgent` does not currently expose a running FastAPI app (`cortexagent/main.py` was removed).
-- `CortexUI` can still run against `CortexLTM` in memory-only mode while the agent runtime is rebuilt.
-- Parts of this README below are historical v1 documentation and will be replaced during the rebuild.
+No regex-based routing or keyword intent triggers are used for planner decisions.
 
-v1 goal:
-- Route normal chat to CortexLTM
-- Trigger web search when the user asks for current/external information
-- Persist both user and assistant messages to CortexLTM even when tools are used
-- Support Google Calendar read + write flows with explicit user confirmation
-- Support Google Drive read flows for file discovery/open links
-- Support Gmail list/read/draft flows, plus confirmation-gated send
+## UI Contract
 
-## Release Notes (Feb 14, 2026)
+The agent response keeps legacy fields expected by CortexUI:
 
-- Improved routing precision with three explicit buckets:
-  - explicit web-intent cues (for example: "search online", "look up", "show links")
-  - time-sensitive fact requests (latest/news/price/schedule style questions)
-  - non-web writing/coding tasks that should stay in normal chat
-- Added safer verification override behavior:
-  - high-stakes verification can force web search for factual question-style prompts
-  - drafting/coding/translation-style prompts are not force-routed to web search
-- Improved high-stakes verification responses by appending source links when checks fail.
-- Added Google Calendar write support via quick-add with confirmation-first flow:
-  - write intents now route to Google Calendar more reliably, including common phrasing/typos
-  - draft prompts include structured event fields (title/day/time and assumptions when inferred)
-  - user can confirm with `confirm` (or `confirm: ...`) and cancel with `cancel`
-  - follow-up edits (for example title changes) are merged into the pending draft
-- Added created-event proof links in post-write responses:
-  - created entries include direct Google Calendar event links when available
-- Added anti-hallucination safety for calendar writes:
-  - chat-only responses are prevented from claiming an event was added unless calendar tooling executed
-- Added Gmail tool support:
-  - list recent inbox threads
-  - read latest email or a specific `thread <id>`
-  - draft replies to a thread
-  - send drafts only after explicit confirmation
-  - optional recipient-domain policy via `GMAIL_ALLOWED_RECIPIENT_DOMAINS`
-  - prompt-injection line filtering on email content previews
-- Added Google Drive tool support:
-  - list/search recent files and return direct Drive links
-  - routes Drive-specific prompts to `google_drive`
-  - uses read-only metadata scope for safety
-- Added multi-step orchestration mode for compound prompts:
-  - detects multi-intent requests spanning Gmail + Drive + Calendar (+ optional web)
-  - executes ordered tool steps in a single turn
-  - stores structured per-step pipeline metadata in thread events
-- Added LLM-first planner for multi-step orchestration:
-  - strict JSON plan output with schema validation and bounded tool allowlist
-  - dynamic step composition across Gmail/Calendar/Drive/Web Search
-  - deterministic fallback to legacy regex planner + single-route classifier
-  - planner diagnostics persisted in orchestration metadata (`planner_used`, confidence, validation, fallback reason)
-- Improved pending confirmation intent handling:
-  - LLM-assisted + deterministic confirmation classifier for noisy replies
-  - recognizes sloppy confirms/cancels (for example: `yehhhh`, `yuppp`, `nahhh`, `nopeee`)
-  - avoids auto-confirm on ambiguous replies and keeps explicit write confirmations for Gmail/Calendar
+- `decision`
+- `tool_pipeline`
+- `sources`
 
-## Architecture
+CortexUI still receives:
 
-- `cortexagent/router/intent_router.py`
-  - Heuristic/model intent gating (`chat` vs `web_search` vs `google_calendar` vs `google_drive` vs `google_gmail`)
-- `cortexagent/services/planner.py`
-  - LLM-first orchestration planner with strict JSON schema + fallback diagnostics
-- `cortexagent/services/confirmation_intent.py`
-  - Pending-confirmation intent classifier (deterministic + optional LLM assist)
-- `cortexagent/services/llm_json_client.py`
-  - Shared OpenAI-compatible JSON completion caller (Groq and openai/openai_compatible providers)
-- `cortexagent/tools/base.py`
-  - Generic tool interfaces
-- `cortexagent/tools/registry.py`
-  - Tool registration and lookup
-- `cortexagent/tools/web_search.py`
-  - Web search tool with provider abstraction
-- `cortexagent/tools/google_calendar.py`
-  - Google Calendar list + create logic (confirmation-gated writes)
-- `cortexagent/tools/google_gmail.py`
-  - Gmail thread list/read, draft-reply, and confirmation-gated send
-- `cortexagent/tools/google_drive.py`
-  - Google Drive file discovery/listing and deep links (read-only)
-- `cortexagent/services/cortexltm_client.py`
-  - HTTP client for CortexLTM endpoints
-- `cortexagent/services/orchestrator.py`
-  - End-to-end chat orchestration
-- `cortexagent/main.py`
-  - FastAPI app + routes
+- `x-cortex-agent-trace`
+- `x-cortex-route-mode`
 
-## Setup
+through the existing proxy behavior in `CortexUI`.
 
-When using the top-level `Cortex.cmd` runner, CortexAgent and CortexLTM share the same
-Python interpreter at `CortexLTM/.venv/Scripts/python.exe`.
+## Google Integrations
 
-1. Shared venv workflow (recommended with `Cortex.cmd`):
+Google account connect/disconnect/status routes are provided:
 
-```powershell
-cd ..\CortexLTM
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-cd ..\CortexAgent
-pip install -r requirements.txt
-```
+- `POST /v1/agent/integrations/google/connect`
+- `GET /v1/agent/integrations/google/status`
+- `POST /v1/agent/integrations/google/disconnect`
 
-2. Optional standalone venv workflow (manual CortexAgent-only runs):
+Google tool adapters retained:
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+- Calendar: `cortexagent/tools/google_calendar.py`
+- Drive: `cortexagent/tools/google_drive.py`
+- Gmail: `cortexagent/tools/google_gmail.py`
 
-3. Configure env:
+## API Route
 
-```powershell
-copy .env.example .env
-```
+- `POST /v1/agent/threads/{thread_id}/chat`
 
-4. Start server:
+Response model:
 
-```powershell
-uvicorn cortexagent.main:app --host 0.0.0.0 --port 8010
+```json
+{
+  "thread_id": "string",
+  "response": "assistant text",
+  "decision": {
+    "action": "chat|orchestration|<tool_name>",
+    "reason": "planner rationale",
+    "confidence": 0.0
+  },
+  "sources": [{"title": "string", "url": "string"}],
+  "tool_pipeline": []
+}
 ```
 
 ## Environment
 
 Required:
-- `CORTEXLTM_API_BASE_URL` (example: `http://127.0.0.1:8000`)
+
+- `CORTEXLTM_API_BASE_URL`
+- `AGENT_PLANNER_LLM_PROVIDER`
+- `AGENT_PLANNER_LLM_MODEL`
+- `AGENT_PLANNER_LLM_API_KEY` (or `GROQ_API_KEY`)
 
 Optional:
-- `CORTEXLTM_API_KEY` (forwarded as `x-api-key`)
-- `AGENT_TOOLS_ENABLED` (`true`/`false`, default `true`)
-- `WEB_SEARCH_ENABLED` (`true`/`false`, default `true`)
-- `WEB_SEARCH_PROVIDER` (comma-separated fallback chain; e.g. `duckduckgo,bing,brave`; default `duckduckgo,bing`)
-- `BRAVE_SEARCH_API_KEY` (required for Brave provider)
-- `WEB_SEARCH_TIMEOUT_SECONDS` (default `8`)
-- `WEB_SEARCH_MAX_RESULTS` (default `5`)
-- `WEB_SEARCH_RETRIES` (per-provider retry count, default `2`)
-- `AGENT_ROUTER_LLM_ENABLED` (`true`/`false`, default `true`)
-- `AGENT_ROUTER_LLM_MODEL` (default: `AGENT_ROUTER_LLM_MODEL` -> `GROQ_ROUTER_MODEL` -> `GROQ_CHAT_MODEL` -> `llama-3.1-8b-instant`)
-- `AGENT_ROUTER_LLM_TIMEOUT_SECONDS` (default `6`)
-- `GROQ_API_KEY` (enables model-based route decisions; without it router falls back to heuristics)
-- `AGENT_PLANNER_LLM_ENABLED` (`true`/`false`, default `true`)
-- `AGENT_PLANNER_LLM_PROVIDER` (`groq` or `openai`/`openai_compatible`, default `groq`)
-- `AGENT_PLANNER_LLM_MODEL` (planner model id; defaults to router model chain, e.g. `llama-3.1-8b-instant`)
+
+- `CORTEXLTM_API_KEY`
 - `AGENT_PLANNER_LLM_TIMEOUT_SECONDS` (default `8`)
-- `AGENT_PLANNER_MAX_STEPS` (max validated planner steps, default `4`)
-- `AGENT_PLANNER_MIN_CONFIDENCE` (minimum accepted planner confidence in `[0,1]`, default `0.55`)
-- `AGENT_DECISION_MODE` (`hybrid`, `llm_first`, or `llm_only`; default `llm_only`)
-- `AGENT_PLANNER_LLM_API_BASE_URL` (required for `openai`/`openai_compatible`; defaults to `https://api.openai.com/v1`)
-- `AGENT_PLANNER_LLM_API_KEY` (planner provider API key; defaults to `GROQ_API_KEY` for Groq compatibility)
-- `AGENT_CONFIRMATION_LLM_ENABLED` (`true`/`false`, default `true`)
-- `AGENT_CONFIRMATION_LLM_TIMEOUT_SECONDS` (default `4`)
-- `AGENT_CONFIRMATION_LLM_MIN_CONFIDENCE` (minimum accepted confirmation-classifier confidence, default `0.72`)
-- `SUPABASE_URL` (required for integration connect routes that validate bearer auth)
-- `SUPABASE_ANON_KEY` (required for integration connect routes that validate bearer auth)
-- `SUPABASE_SERVICE_ROLE_KEY` (required for connected-account writes via Supabase PostgREST)
+- `AGENT_PLANNER_MAX_STEPS` (default `4`)
+- `AGENT_PLANNER_CONTEXT_MESSAGES` (default `10`)
+- `AGENT_PLANNER_LLM_API_BASE_URL`
+- `AGENT_SYNTHESIS_LLM_ENABLED` (default `true`)
+- `AGENT_SYNTHESIS_LLM_PROVIDER`
+- `AGENT_SYNTHESIS_LLM_MODEL`
+- `AGENT_SYNTHESIS_LLM_TIMEOUT_SECONDS` (default `10`)
+- `AGENT_SYNTHESIS_LLM_API_BASE_URL`
+- `AGENT_SYNTHESIS_LLM_API_KEY`
+
+Connected account / OAuth:
+
+- `SUPABASE_URL`
+- `SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`
 - `CONNECTED_ACCOUNTS_TABLE` (default `ltm_connected_accounts`)
 - `CONNECTED_ACCOUNTS_TIMEOUT_SECONDS` (default `8`)
-- `GOOGLE_CLIENT_ID` (required for Google OAuth code exchange)
-- `GOOGLE_CLIENT_SECRET` (required for Google OAuth code exchange)
-- `GOOGLE_REDIRECT_URI` (must exactly match Google OAuth client redirect URI)
+- `CONNECTED_ACCOUNTS_TOKEN_ENCRYPTION_KEY` (recommended)
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REDIRECT_URI`
 - `GOOGLE_OAUTH_TIMEOUT_SECONDS` (default `8`)
-- `GMAIL_ALLOWED_RECIPIENT_DOMAINS` (optional comma-separated allowlist for send safety, e.g. `gmail.com,company.com`)
 
-## Route
+## Run
 
-- `POST /v1/agent/threads/{thread_id}/chat`
-  - If tool intent is detected and enabled, runs web search, Google Calendar, Google Drive, or Gmail action.
-  - Otherwise forwards to CortexLTM `/v1/threads/{thread_id}/chat`.
-- `POST /v1/agent/integrations/google/connect`
-  - Exchanges Google OAuth `code` for tokens, validates caller via bearer token, and upserts a row in `ltm_connected_accounts`.
-
-## Notes
-
-- The tool system is intentionally modular for future connectors (Notion, Slack, Calendar, etc.).
-- Routing is model-first (system-prompt classifier) with heuristic fallback.
-- Multi-step orchestration is planner-first with strict validation and deterministic fallback.
-- Calendar write confirmations are intentionally explicit to avoid accidental writes.
-- GPT-OSS migration path: keep `AGENT_PLANNER_LLM_PROVIDER=groq` for current Llama flow, or switch planner to `openai`/`openai_compatible` with `AGENT_PLANNER_LLM_MODEL=<gpt-oss-model>` and provider base URL/API key.
+```powershell
+uvicorn cortexagent.main:app --host 0.0.0.0 --port 8010
+```

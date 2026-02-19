@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -19,9 +18,11 @@ class GoogleDriveTool(Tool):
         if not isinstance(access_token, str) or not access_token.strip():
             raise RuntimeError("Google account is not connected. Please connect Google first.")
 
+        tool_meta = context.tool_meta if isinstance(context.tool_meta, dict) else {}
+        args = tool_meta.get("args") if isinstance(tool_meta.get("args"), dict) else {}
         user_text = (context.user_text or "").strip()
         max_results = 8
-        query = _extract_drive_query(user_text)
+        query = str((args or {}).get("query") or "").strip() or None
         items = self._list_files(
             access_token=access_token.strip(),
             max_results=max_results,
@@ -99,19 +100,6 @@ class GoogleDriveTool(Tool):
                 )
             )
         return out
-
-
-def _extract_drive_query(text: str) -> str | None:
-    lowered = (text or "").strip()
-    if not lowered:
-        return None
-    quoted = re.search(r"\"([^\"]{2,120})\"", lowered)
-    if quoted:
-        return quoted.group(1).strip()
-    about = re.search(r"\b(?:for|named|called|about)\s+([a-z0-9][a-z0-9 _.\-]{2,120})$", lowered, re.IGNORECASE)
-    if about:
-        return about.group(1).strip()
-    return None
 
 
 def _friendly_type(mime_type: str) -> str:

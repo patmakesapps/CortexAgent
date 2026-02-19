@@ -14,6 +14,10 @@ class GoogleGmailTool(Tool):
     THREADS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/threads"
     DRAFTS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
     SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send"
+    PRIMARY_INBOX_QUERY = (
+        "in:inbox category:primary -category:social "
+        "-category:promotions -category:updates -category:forums"
+    )
 
     def run(self, context: ToolContext) -> ToolResult:
         tool_meta = context.tool_meta or {}
@@ -25,7 +29,7 @@ class GoogleGmailTool(Tool):
 
         operation = str(tool_meta.get("operation") or "read").strip().lower()
         args = tool_meta.get("args") if isinstance(tool_meta.get("args"), dict) else {}
-        max_results = self._coerce_max_results(tool_meta.get("max_results"), default=8)
+        max_results = self._coerce_max_results(tool_meta.get("max_results"), default=5)
         query = str((args or {}).get("query") or "").strip()
 
         if operation == "send":
@@ -84,21 +88,29 @@ class GoogleGmailTool(Tool):
         threads = self._list_recent_threads(
             access_token=access_token,
             max_results=max_results,
-            inbox_query=query or "in:inbox",
+            inbox_query=self._normalize_primary_query(query),
         )
         return ToolResult(tool_name=self.name, query=context.user_text, items=threads)
 
     @staticmethod
     def _coerce_max_results(value: object, default: int) -> int:
         if isinstance(value, int):
-            return max(1, min(value, 50))
+            return max(1, min(value, 5))
         if isinstance(value, str):
             try:
                 parsed = int(value.strip())
             except ValueError:
                 return default
-            return max(1, min(parsed, 50))
+            return max(1, min(parsed, 5))
         return default
+
+    @classmethod
+    def _normalize_primary_query(cls, raw_query: str) -> str:
+        base = cls.PRIMARY_INBOX_QUERY
+        query = (raw_query or "").strip()
+        if not query:
+            return base
+        return f"({query}) {base}"
 
     def _list_recent_threads(
         self,
